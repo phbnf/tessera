@@ -1,25 +1,25 @@
-# Tessera on Amazon Web Services
+# Tessera on Postgres and Amazon Web Services
 
-This document describes the storage implementation for running Tessera on Amazon Web Services (AWS).
+This document describes the storage implementation for running Tessera on Postgres and Amazon Web Services (AWS).
 
 ## Overview
 
 This design takes advantage of Amazon S3 for long-term storage and low-cost, low-complexity serving of read traffic.
-It uses Amazon Aurora (MySQL) for coordinating writes.
+It uses Postgres for coordinating writes.
 
 New entries flow in from the binary built with Tessera into transactional storage, where they're held
 temporarily to batch them up, and then assigned sequence numbers as each batch is flushed.
 This allows the `Add` API call to quickly return with *durably assigned* sequence numbers.
 
 From there, an async process derives the entry bundles and Merkle tree structure from the sequenced batches,
-writes these to GCS for serving, before finally removing integrated bundles from the transactional storage.
+writes these to S3 for serving, before finally removing integrated bundles from the transactional storage.
 
 Since entries are all sequenced by the time they're stored, and sequencing is done in "chunks", it's worth
 noting that all tree derivations are therefore idempotent.
 
 ## Transactional storage
 
-The transactional storage is implemented with Aurora MySQL, and uses a schema with the following tables:
+The transactional storage is implemented with Postgres, and uses a schema with the following tables:
    * `Tessera`: This table is used to identify the current schema version.
    * `SeqCoord`: A table with a single row which is used to keep track of the next assignable sequence number.
    * `Seq`: This holds batches of entries keyed by the sequence number assigned to the first entry in the batch.
@@ -51,49 +51,14 @@ The transactional storage is implemented with Aurora MySQL, and uses a schema wi
    1. Update `IntCoord` with `seq+=num_entries_integrated` and the latest `rootHash`
 1. Checkpoints representing the latest state of the tree are published at the configured interval.
 
-## Antispam
-
-Two experimental implementations have been tested which uses either Aurora MySQL,
-or a local bbolt database to store the `<identity_hash>` --> `sequence` mapping.
-They work well, but call for further stress testing and cost analysis.
-
 ## Compatibility
 
-This storage implementation is intended to be used with AWS services.
+This storage implementation is intended to be used with Postgres and S3.
 
-However, given that it's based on services which are compatible with MySQL and
+However, given that it's based on services which are compatible with Postgres and
 S3 protocols, it's possible that it will work with other non-AWS-based backends
 which are compatible with these protocols.
 
 Given the vast array of combinations of backend implementations and versions,
-using this storage implementation outside of AWS isn't officially supported, although
+using this storage implementation with non-standard Postgres/S3 isn't officially supported, although
 there may be folks who can help with issues in the Transparency-Dev slack.
-
-Similarly, PRs raised against it relating to its use outside of AWS are unlikely to
-be accepted unless it's shown that they have no detremental effect to the implementation's
-performance on AWS.
-
-### Alternatives considered
-
-Other transactional storage systems are available on AWS, e.g. Redshift, RDS or
-DynamoDB. Experiments were run using Aurora (MySQL, Serverless v2), RDS (MySQL),
-and DynamoDB.
-
-Aurora (MySQL) worked out to be a good compromise between cost, performance,
-operational overhead, code complexity, and so was selected.
-
-The alpha implementation was tested with entries of size 1KB each, at a write
-rate of 1500/s. This was done using the smallest possible Aurora instance
-available, `db.r5.large`, running `8.0.mysql_aurora.3.05.2`.
-
-Aurora (Serverless v2) worked out well, but seems less cost effective than
-provisioned Aurora for sustained traffic. For now, we decided not to explore this option further.
-
-RDS (MySQL) worked out well, but requires more administrative overhead than
-Aurora. For now, we decided not to explore this option further.
-
-DynamoDB worked out to be less cost efficient than Aurora and RDS. It also has
-constraints that introduced a non trivial amount of complexity: max object size
-is 400KB,  max transaction size is {4MB OR 25 rows for write OR 100 rows for
-reads}, binary values must be base64 encoded, arrays of bytes are marshaled as
-sets by default (as of Dec. 2024). We decided not to explore this option further.

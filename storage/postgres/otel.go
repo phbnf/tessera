@@ -21,7 +21,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const name = "github.com/transparency-dev/tessera/storage/aws"
+const name = "github.com/transparency-dev/tessera/storage/postgres"
 
 var (
 	meter  = otel.Meter(name)

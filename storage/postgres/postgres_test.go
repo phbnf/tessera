@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// This the tests for a MySQL+S3 AWS Tessera implementation.  It requires a
-// MySQL database to successfully run the MySQL tests, otherwise they are
+// This the tests for a Postgres+S3 AWS Tessera implementation.  It requires a
+// Postgres database to successfully run the Postgres tests, otherwise they are
 // skipped.  Run tests with `-parallel=1` to avoid concurent tests on the same
 // database, and specifically runs of `mustDropTables`.
 //
-// Sample command to start a local MySQL database using Docker:
-// $ docker run --name test-mysql -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=test_tessera -d mysql
+// Sample command to start a local Postgres database using Docker:
+// $ docker run --name test-postgres -p 5432:5432 -e POSTGRES_PASSWORD=root -e POSTGRES_DB=test_tessera -d postgres
 package postgres
 
 import (
@@ -47,11 +47,13 @@ import (
 	storage "github.com/transparency-dev/tessera/storage/internal"
 	"golang.org/x/mod/sumdb/note"
 	"k8s.io/klog/v2"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 var (
-	mySQLURI            = flag.String("mysql_uri", "root:root@tcp(localhost:3306)/test_tessera", "Connection string for a MySQL database")
-	isMySQLTestOptional = flag.Bool("is_mysql_test_optional", true, "Boolean value to control whether the MySQL test is optional")
+	postgresURI            = flag.String("postgres_uri", "postgres://postgres:root@localhost:5432/test_tessera", "Connection string for a Postgres database")
+	isPostgresTestOptional = flag.Bool("is_postgres_test_optional", true, "Boolean value to control whether the Postgres test is optional")
 )
 
 // TestMain inits flags and runs tests.
@@ -61,45 +63,45 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// canSkipMySQLTest checks if the test MySQL db is available and, if not, if the test can be skipped.
+// canSkipPostgresTest checks if the test Postgres db is available and, if not, if the test can be skipped.
 //
-// Use this method before every MySQL test, and if it returns true, skip the test.
+// Use this method before every Postgres test, and if it returns true, skip the test.
 //
-// If is_mysql_test_optional is set to true and MySQL database cannot be opened or pinged,
+// If is_postgres_test_optional is set to true and Postgres database cannot be opened or pinged,
 // the test will fail immediately. Otherwise, the test will be skipped if the test is optional
 // and the database is not available.
-func canSkipMySQLTest(t *testing.T, ctx context.Context) bool {
+func canSkipPostgresTest(t *testing.T, ctx context.Context) bool {
 	t.Helper()
 
-	db, err := sql.Open("mysql", *mySQLURI)
+	db, err := sql.Open("pgx", *postgresURI)
 	if err != nil {
-		if *isMySQLTestOptional {
+		if *isPostgresTestOptional {
 			return true
 		}
-		t.Fatalf("failed to open MySQL test db: %v", err)
+		t.Fatalf("failed to open Postgres test db: %v", err)
 	}
 	defer func() {
 		if err := db.Close(); err != nil {
-			t.Fatalf("failed to close MySQL database: %v", err)
+			t.Fatalf("failed to close Postgres database: %v", err)
 		}
 	}()
 	if err := db.PingContext(ctx); err != nil {
-		if *isMySQLTestOptional {
+		if *isPostgresTestOptional {
 			return true
 		}
-		t.Fatalf("failed to ping MySQL test db: %v", err)
+		t.Fatalf("failed to ping Postgres test db: %v", err)
 	}
 	return false
 }
 
 // mustDropTables drops the `Seq`, `SeqCoord` and `IntCoord` tables.
-// Call this function before every MySQL test.
+// Call this function before every Postgres test.
 func mustDropTables(t *testing.T, ctx context.Context) {
 	t.Helper()
 
-	db, err := sql.Open("mysql", *mySQLURI)
+	db, err := sql.Open("pgx", *postgresURI)
 	if err != nil {
-		t.Fatalf("failed to connect to db: %v", *mySQLURI)
+		t.Fatalf("failed to connect to db: %v", *postgresURI)
 	}
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -107,23 +109,23 @@ func mustDropTables(t *testing.T, ctx context.Context) {
 		}
 	}()
 
-	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS `Seq`, `SeqCoord`, `IntCoord`, `PubCoord`, `GCCoord`"); err != nil {
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS Seq, SeqCoord, IntCoord, PubCoord, GCCoord, Tessera"); err != nil {
 		t.Fatalf("failed to drop all tables: %v", err)
 	}
 }
 
-func TestMySQLSequencerAssignEntries(t *testing.T) {
+func TestPostgresSequencerAssignEntries(t *testing.T) {
 	ctx := context.Background()
-	if canSkipMySQLTest(t, ctx) {
-		klog.Warningf("MySQL not available, skipping %s", t.Name())
-		t.Skip("MySQL not available, skipping test")
+	if canSkipPostgresTest(t, ctx) {
+		klog.Warningf("Postgres not available, skipping %s", t.Name())
+		t.Skip("Postgres not available, skipping test")
 	}
 	// Clean tables in case there's already something in there.
 	mustDropTables(t, ctx)
 
-	seq, err := newMySQLSequencer(ctx, *mySQLURI, 1000, 0, 0)
+	seq, err := newPostgresSequencer(ctx, *postgresURI, 1000, 0, 0)
 	if err != nil {
-		t.Fatalf("newMySQLSequencer: %v", err)
+		t.Fatalf("newPostgresSequencer: %v", err)
 	}
 
 	want := uint64(0)
@@ -144,11 +146,11 @@ func TestMySQLSequencerAssignEntries(t *testing.T) {
 	}
 }
 
-func TestMySQLSequencerPushback(t *testing.T) {
+func TestPostgresSequencerPushback(t *testing.T) {
 	ctx := context.Background()
-	if canSkipMySQLTest(t, ctx) {
-		klog.Warningf("MySQL not available, skipping %s", t.Name())
-		t.Skip("MySQL not available, skipping test")
+	if canSkipPostgresTest(t, ctx) {
+		klog.Warningf("Postgres not available, skipping %s", t.Name())
+		t.Skip("Postgres not available, skipping test")
 	}
 	// Clean tables in case there's already something in there.
 	mustDropTables(t, ctx)
@@ -179,9 +181,9 @@ func TestMySQLSequencerPushback(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			mustDropTables(t, ctx)
 
-			seq, err := newMySQLSequencer(ctx, *mySQLURI, test.threshold, 0, 0)
+			seq, err := newPostgresSequencer(ctx, *postgresURI, test.threshold, 0, 0)
 			if err != nil {
-				t.Fatalf("newMySQLSequencer: %v", err)
+				t.Fatalf("newPostgresSequencer: %v", err)
 			}
 			// Set up the test scenario with the configured number of initial outstanding entries
 			entries := []*tessera.Entry{}
@@ -204,18 +206,18 @@ func TestMySQLSequencerPushback(t *testing.T) {
 	}
 }
 
-func TestMySQLSequencerRoundTrip(t *testing.T) {
+func TestPostgresSequencerRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	if canSkipMySQLTest(t, ctx) {
-		klog.Warningf("MySQL not available, skipping %s", t.Name())
-		t.Skip("MySQL not available, skipping test")
+	if canSkipPostgresTest(t, ctx) {
+		klog.Warningf("Postgres not available, skipping %s", t.Name())
+		t.Skip("Postgres not available, skipping test")
 	}
 	// Clean tables in case there's already something in there.
 	mustDropTables(t, ctx)
 
-	s, err := newMySQLSequencer(ctx, *mySQLURI, 1000, 0, 0)
+	s, err := newPostgresSequencer(ctx, *postgresURI, 1000, 0, 0)
 	if err != nil {
-		t.Fatalf("newMySQLSequencer: %v", err)
+		t.Fatalf("newPostgresSequencer: %v", err)
 	}
 
 	seq := 0
@@ -374,9 +376,9 @@ func TestBundleRoundtrip(t *testing.T) {
 
 func TestPublishTree(t *testing.T) {
 	ctx := context.Background()
-	if canSkipMySQLTest(t, ctx) {
-		klog.Warningf("MySQL not available, skipping %s", t.Name())
-		t.Skip("MySQL not available, skipping test")
+	if canSkipPostgresTest(t, ctx) {
+		klog.Warningf("Postgres not available, skipping %s", t.Name())
+		t.Skip("Postgres not available, skipping test")
 	}
 
 	for _, test := range []struct {
@@ -422,9 +424,9 @@ func TestPublishTree(t *testing.T) {
 			// Clean tables in case there's already something in there.
 			mustDropTables(t, ctx)
 
-			s, err := newMySQLSequencer(ctx, *mySQLURI, 1000, 0, 0)
+			s, err := newPostgresSequencer(ctx, *postgresURI, 1000, 0, 0)
 			if err != nil {
-				t.Fatalf("newMySQLSequencer: %v", err)
+				t.Fatalf("newPostgresSequencer: %v", err)
 			}
 			m := newMemObjStore()
 			storage := &Appender{
@@ -472,9 +474,9 @@ func TestPublishTree(t *testing.T) {
 
 func TestGarbageCollect(t *testing.T) {
 	ctx := t.Context()
-	if canSkipMySQLTest(t, ctx) {
-		klog.Warningf("MySQL not available, skipping %s", t.Name())
-		t.Skip("MySQL not available, skipping test")
+	if canSkipPostgresTest(t, ctx) {
+		klog.Warningf("Postgres not available, skipping %s", t.Name())
+		t.Skip("Postgres not available, skipping test")
 	}
 	// Clean tables in case there's already something in there.
 	mustDropTables(t, ctx)
@@ -482,9 +484,9 @@ func TestGarbageCollect(t *testing.T) {
 	batchSize := uint64(60000)
 	integrateEvery := uint64(31234)
 
-	s, err := newMySQLSequencer(ctx, *mySQLURI, batchSize, 0, 0)
+	s, err := newPostgresSequencer(ctx, *postgresURI, batchSize, 0, 0)
 	if err != nil {
-		t.Fatalf("newMySQLSequencer: %v", err)
+		t.Fatalf("newPostgresSequencer: %v", err)
 	}
 	defer func() {
 		if err := s.dbPool.Close(); err != nil {
@@ -594,16 +596,16 @@ func TestGarbageCollectOption(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 
 			ctx := t.Context()
-			if canSkipMySQLTest(t, ctx) {
-				klog.Warningf("MySQL not available, skipping %s", t.Name())
-				t.Skip("MySQL not available, skipping test")
+			if canSkipPostgresTest(t, ctx) {
+				klog.Warningf("Postgres not available, skipping %s", t.Name())
+				t.Skip("Postgres not available, skipping test")
 			}
 			// Clean tables in case there's already something in there.
 			mustDropTables(t, ctx)
 
-			s, err := newMySQLSequencer(ctx, *mySQLURI, batchSize, 0, 0)
+			s, err := newPostgresSequencer(ctx, *postgresURI, batchSize, 0, 0)
 			if err != nil {
-				t.Fatalf("newMySQLSequencer: %v", err)
+				t.Fatalf("newPostgresSequencer: %v", err)
 			}
 			defer func() {
 				if err := s.dbPool.Close(); err != nil {

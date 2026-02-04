@@ -12,19 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package aws contains an AWS-based storage implementation for Tessera.
+// Package postgres contains an AWS-based storage implementation for Tessera.
 //
 // TODO: decide whether to rename this package.
 //
 // This storage implementation uses S3 for long-term storage and serving of
-// entry bundles and log tiles, and MySQL for coordinating updates to AWS
+// entry bundles and log tiles, and Postgres for coordinating updates to AWS
 // when multiple instances of a personality binary are running.
 //
 // A single S3 bucket is used to hold entry bundles and log internal tiles.
 // The object keys for the bucket are selected so as to conform to the
 // expected layout of a tile-based log.
 //
-// A MySQL database provides a transactional mechanism to allow multiple
+// A Postgres database provides a transactional mechanism to allow multiple
 // frontends to safely update the contents of the log.
 package postgres
 
@@ -63,7 +63,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
 
-	"github.com/go-sql-driver/mysql"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 const (
@@ -146,9 +146,9 @@ type Config struct {
 	// BucketPrefix is an optional prefix to prepend to all log resource paths.
 	// This can be used e.g. to store multiple logs in the same bucket.
 	BucketPrefix string
-	// DSN is the DSN of the MySQL instance to use.
+	// DSN is the DSN of the PostgreSQL instance to use.
 	DSN string
-	// Maximum connections to the MySQL database.
+	// Maximum connections to the PostgreSQL database.
 	MaxOpenConns int
 	// Maximum idle database connections in the connection pool.
 	MaxIdleConns int
@@ -186,9 +186,9 @@ func New(ctx context.Context, cfg Config) (tessera.Driver, error) {
 
 // Appender creates a new tessera.Appender lifecycle object.
 func (s *Storage) Appender(ctx context.Context, opts *tessera.AppendOptions) (*tessera.Appender, tessera.LogReader, error) {
-	seq, err := newMySQLSequencer(ctx, s.cfg.DSN, uint64(opts.PushbackMaxOutstanding()), s.cfg.MaxOpenConns, s.cfg.MaxIdleConns)
+	seq, err := newPostgresSequencer(ctx, s.cfg.DSN, uint64(opts.PushbackMaxOutstanding()), s.cfg.MaxOpenConns, s.cfg.MaxIdleConns)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create MySQL sequencer: %v", err)
+		return nil, nil, fmt.Errorf("failed to create Postgres sequencer: %v", err)
 	}
 
 	s3Store := &s3Storage{
@@ -328,7 +328,7 @@ func (a *Appender) garbageCollectorJob(ctx context.Context, i time.Duration) {
 		case <-t.C:
 		}
 		func() {
-			ctx, span := tracer.Start(ctx, "tessera.storage.aws.garbageCollectJob")
+			ctx, span := tracer.Start(ctx, "tessera.storage.postgres.garbageCollectJob")
 			defer span.End()
 
 			// Figure out the size of the latest published checkpoint - we can't be removing partial tiles implied by
@@ -506,9 +506,9 @@ func (s *Storage) MigrationWriter(ctx context.Context, opts *tessera.MigrationOp
 		},
 		entriesPath: opts.EntriesPath(),
 	}
-	seq, err := newMySQLSequencer(ctx, s.cfg.DSN, DefaultPushbackMaxOutstanding, s.cfg.MaxOpenConns, s.cfg.MaxIdleConns)
+	seq, err := newPostgresSequencer(ctx, s.cfg.DSN, DefaultPushbackMaxOutstanding, s.cfg.MaxOpenConns, s.cfg.MaxIdleConns)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create MySQL sequencer: %v", err)
+		return nil, nil, fmt.Errorf("failed to create Postgres sequencer: %v", err)
 	}
 	m := &MigrationStorage{
 		s:            s,
@@ -627,7 +627,7 @@ func (m *MigrationStorage) buildTree(ctx context.Context, sourceSize uint64) (ui
 	}()
 
 	// Figure out which is the starting index of sequenced entries to start consuming from.
-	row := tx.QueryRowContext(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = ? FOR UPDATE", 0)
+	row := tx.QueryRowContext(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = $1 FOR UPDATE", 0)
 	var from uint64
 	var rootHash []byte
 	if err := row.Scan(&from, &rootHash); err != nil {
@@ -656,7 +656,7 @@ func (m *MigrationStorage) buildTree(ctx context.Context, sourceSize uint64) (ui
 	newSize = from + added
 	klog.Infof("Integrate: added %d entries", added)
 
-	if _, err := tx.ExecContext(ctx, "UPDATE IntCoord SET seq=?, rootHash=? WHERE id=?", newSize, newRoot, 0); err != nil {
+	if _, err := tx.ExecContext(ctx, "UPDATE IntCoord SET seq=$1, rootHash=$2 WHERE id=$3", newSize, newRoot, 0); err != nil {
 		return 0, nil, fmt.Errorf("update intcoord: %v", err)
 	}
 
@@ -834,19 +834,19 @@ func integrate(ctx context.Context, fromSeq uint64, lh [][]byte, lrs *logResourc
 	return newRoot, nil
 }
 
-// mySQLSequencer uses MySQL to provide
+// postgresSequencer uses Postgres to provide
 // a durable and thread/multi-process safe sequencer.
-type mySQLSequencer struct {
+type postgresSequencer struct {
 	dbPool         *sql.DB
 	maxOutstanding uint64
 }
 
-// newMySQLSequencer returns a new mysqlSequencer struct which uses the provided
-// DSN for its MySQL connection.
-func newMySQLSequencer(ctx context.Context, dsn string, maxOutstanding uint64, maxOpenConns, maxIdleConns int) (*mySQLSequencer, error) {
-	dbPool, err := sql.Open("mysql", dsn)
+// newPostgresSequencer returns a new postgresSequencer struct which uses the provided
+// DSN for its Postgres connection.
+func newPostgresSequencer(ctx context.Context, dsn string, maxOutstanding uint64, maxOpenConns, maxIdleConns int) (*postgresSequencer, error) {
+	dbPool, err := sql.Open("pgx", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to MySQL db: %v", err)
+		return nil, fmt.Errorf("failed to connect to Postgres db: %v", err)
 	}
 
 	if maxOpenConns > 0 {
@@ -857,10 +857,10 @@ func newMySQLSequencer(ctx context.Context, dsn string, maxOutstanding uint64, m
 	}
 
 	if err := dbPool.Ping(); err != nil {
-		return nil, fmt.Errorf("failed to ping MySQL db: %v", err)
+		return nil, fmt.Errorf("failed to ping Postgres db: %v", err)
 	}
 
-	r := &mySQLSequencer{
+	r := &postgresSequencer{
 		dbPool:         dbPool,
 		maxOutstanding: maxOutstanding,
 	}
@@ -876,7 +876,7 @@ func newMySQLSequencer(ctx context.Context, dsn string, maxOutstanding uint64, m
 
 // checkDataCompatibility compares the Tessera library SchemaCompatibilityVersion with the one stored in the
 // database, and returns an error if they are not identical.
-func (s *mySQLSequencer) checkDataCompatibility(ctx context.Context) error {
+func (s *postgresSequencer) checkDataCompatibility(ctx context.Context) error {
 	row := s.dbPool.QueryRowContext(ctx, "SELECT compatibilityVersion FROM Tessera WHERE id = 0")
 	var gotVersion uint64
 	if err := row.Scan(&gotVersion); err != nil {
@@ -907,19 +907,19 @@ func (s *mySQLSequencer) checkDataCompatibility(ctx context.Context) error {
 //   - IntCoord
 //     This table coordinates integration of the batches of entries stored in
 //     Seq into the committed tree state.
-func (s *mySQLSequencer) initDB(ctx context.Context) error {
+func (s *postgresSequencer) initDB(ctx context.Context) error {
 	if _, err := s.dbPool.ExecContext(ctx,
 		`CREATE TABLE IF NOT EXISTS Tessera (
-			id INT UNSIGNED NOT NULL,
-			compatibilityVersion BIGINT UNSIGNED NOT NULL,
+			id INT NOT NULL,
+			compatibilityVersion BIGINT NOT NULL,
 			PRIMARY KEY (id)
 		)`); err != nil {
 		return err
 	}
 	if _, err := s.dbPool.ExecContext(ctx,
 		`CREATE TABLE IF NOT EXISTS SeqCoord(
-			id INT UNSIGNED NOT NULL,
-			next BIGINT UNSIGNED NOT NULL,
+			id INT NOT NULL,
+			next BIGINT NOT NULL,
 			PRIMARY KEY (id)
 		)`); err != nil {
 		return err
@@ -928,57 +928,39 @@ func (s *mySQLSequencer) initDB(ctx context.Context) error {
 	// Keep in mind that CT leaves can be large, as large as: https://crt.sh/?id=10751627.
 	if _, err := s.dbPool.ExecContext(ctx,
 		`CREATE TABLE IF NOT EXISTS Seq(
-			id INT UNSIGNED NOT NULL,
-			seq BIGINT UNSIGNED NOT NULL,
-			v LONGBLOB,
+			id INT NOT NULL,
+			seq BIGINT NOT NULL,
+			v BYTEA,
 			PRIMARY KEY (id, seq)
 		)`); err != nil {
 		return err
 	}
 	if _, err := s.dbPool.ExecContext(ctx,
 		`CREATE TABLE IF NOT EXISTS IntCoord(
-			id INT UNSIGNED NOT NULL,
-			seq BIGINT UNSIGNED NOT NULL,
-			rootHash TINYBLOB NOT NULL,
+			id INT NOT NULL,
+			seq BIGINT NOT NULL,
+			rootHash BYTEA NOT NULL,
 			PRIMARY KEY (id)
 		)`); err != nil {
 		return err
 	}
 	if _, err := s.dbPool.ExecContext(ctx,
 		`CREATE TABLE IF NOT EXISTS PubCoord(
-			id INT UNSIGNED NOT NULL,
+			id INT NOT NULL,
 			publishedAt BIGINT NOT NULL,
-			size BIGINT UNSIGNED,
+			size BIGINT,
 			PRIMARY KEY (id)
 		)`); err != nil {
 		return err
 	}
 
-	// Attempt to migrate the schema for existing tables.
-	//
-	// Of course MySQL doesn't support IF NOT EXISTS for ADD COLUMN. MariaDB does, but we can't rely on that
-	// here unless we try to divine which DBMS we're _actually_ talking to.
-	//
-	// In theory MariaDB and AuroraDB are MySQL compatible, and that should extend to error codes (MariaDB explicitly
-	// says that error codes between 1000 and 1800 are identical
-	// (https://mariadb.com/docs/server/reference/error-codes/mariadb-error-code-reference).
-	//
-	// So we'll just do it the MySQL way, and ignore any "already exists" error we get back.
-	if _, err := s.dbPool.ExecContext(ctx, `ALTER TABLE PubCoord ADD COLUMN size BIGINT UNSIGNED`); err != nil {
-		if e, ok := err.(*mysql.MySQLError); ok {
-			// If this is anything other than ER_DUP_FIELDNAME (1060), then fail.
-			if e.Number != 1060 {
-				return fmt.Errorf("failed to add column to PubCoord: %v", err)
-			}
-		} else {
-			// Also fail if it wasn't a MySQL error.
-			return fmt.Errorf("failed to add column to PubCoord: %v", err)
-		}
+	if _, err := s.dbPool.ExecContext(ctx, `ALTER TABLE PubCoord ADD COLUMN IF NOT EXISTS size BIGINT`); err != nil {
+		return fmt.Errorf("failed to add column to PubCoord: %v", err)
 	}
 
 	if _, err := s.dbPool.ExecContext(ctx,
 		`CREATE TABLE IF NOT EXISTS GCCoord(
-			id INT UNSIGNED NOT NULL,
+			id INT NOT NULL,
 			fromSize BIGINT NOT NULL,
 			PRIMARY KEY (id)
 		)`); err != nil {
@@ -990,23 +972,23 @@ func (s *mySQLSequencer) initDB(ctx context.Context) error {
 	// Note that this will only succeed if no row exists, so there's no danger
 	// of "resetting" an existing log.
 	if _, err := s.dbPool.ExecContext(ctx,
-		`INSERT IGNORE INTO Tessera (id, compatibilityVersion) VALUES (0, ?)`, SchemaCompatibilityVersion); err != nil {
+		`INSERT INTO Tessera (id, compatibilityVersion) VALUES (0, $1) ON CONFLICT DO NOTHING`, SchemaCompatibilityVersion); err != nil {
 		return err
 	}
 	if _, err := s.dbPool.ExecContext(ctx,
-		`INSERT IGNORE INTO SeqCoord (id, next) VALUES (0, 0)`); err != nil {
+		`INSERT INTO SeqCoord (id, next) VALUES (0, 0) ON CONFLICT DO NOTHING`); err != nil {
 		return err
 	}
 	if _, err := s.dbPool.ExecContext(ctx,
-		`INSERT IGNORE INTO IntCoord (id, seq, rootHash) VALUES (0, 0, ?)`, rfc6962.DefaultHasher.EmptyRoot()); err != nil {
+		`INSERT INTO IntCoord (id, seq, rootHash) VALUES (0, 0, $1) ON CONFLICT DO NOTHING`, rfc6962.DefaultHasher.EmptyRoot()); err != nil {
 		return err
 	}
 	if _, err := s.dbPool.ExecContext(ctx,
-		`INSERT IGNORE INTO PubCoord (id, publishedAt, size) VALUES (0, 0, 0)`); err != nil {
+		`INSERT INTO PubCoord (id, publishedAt, size) VALUES (0, 0, 0) ON CONFLICT DO NOTHING`); err != nil {
 		return err
 	}
 	if _, err := s.dbPool.ExecContext(ctx,
-		`INSERT IGNORE INTO GCCoord (id, fromSize) VALUES (0, 0)`); err != nil {
+		`INSERT INTO GCCoord (id, fromSize) VALUES (0, 0) ON CONFLICT DO NOTHING`); err != nil {
 		return err
 	}
 	return nil
@@ -1015,13 +997,13 @@ func (s *mySQLSequencer) initDB(ctx context.Context) error {
 // assignEntries durably assigns each of the passed-in entries an index in the log.
 //
 // Entries are allocated contiguous indices, in the order in which they appear in the entries parameter.
-// This is achieved by storing the passed-in entries in the Seq table in MySQL, keyed by the
+// This is achieved by storing the passed-in entries in the Seq table in Postgres, keyed by the
 // index assigned to the first entry in the batch.
-func (s *mySQLSequencer) assignEntries(ctx context.Context, entries []*tessera.Entry) error {
+func (s *postgresSequencer) assignEntries(ctx context.Context, entries []*tessera.Entry) error {
 	// First grab the treeSize in a non-locking read-only fashion (we don't want to block/collide with integration).
 	// We'll use this value to determine whether we need to apply back-pressure.
 	var treeSize uint64
-	row := s.dbPool.QueryRowContext(ctx, "SELECT seq FROM IntCoord WHERE id = ?", 0)
+	row := s.dbPool.QueryRowContext(ctx, "SELECT seq FROM IntCoord WHERE id = $1", 0)
 	if err := row.Scan(&treeSize); err == sql.ErrNoRows {
 		return nil
 	} else if err != nil {
@@ -1043,7 +1025,7 @@ func (s *mySQLSequencer) assignEntries(ctx context.Context, entries []*tessera.E
 
 	// First we need to grab the next available sequence number from the SeqCoord table.
 	var next, id uint64
-	r := tx.QueryRowContext(ctx, "SELECT id, next FROM SeqCoord WHERE id = ? FOR UPDATE", 0)
+	r := tx.QueryRowContext(ctx, "SELECT id, next FROM SeqCoord WHERE id = $1 FOR UPDATE", 0)
 	if err := r.Scan(&id, &next); err != nil {
 		return fmt.Errorf("failed to read seqcoord: %v", err)
 	}
@@ -1074,11 +1056,11 @@ func (s *mySQLSequencer) assignEntries(ctx context.Context, entries []*tessera.E
 	num := uint64(len(entries))
 
 	// Insert our newly sequenced batch of entries into Seq,
-	if _, err := tx.ExecContext(ctx, "INSERT INTO Seq(id, seq, v) VALUES(?, ?, ?)", 0, next, data); err != nil {
+	if _, err := tx.ExecContext(ctx, "INSERT INTO Seq(id, seq, v) VALUES($1, $2, $3)", 0, next, data); err != nil {
 		return fmt.Errorf("insert into seq: %v", err)
 	}
 	// and update the next-available sequence number row in SeqCoord.
-	if _, err := tx.ExecContext(ctx, "UPDATE SeqCoord SET next = ? WHERE ID = ?", next+num, 0); err != nil {
+	if _, err := tx.ExecContext(ctx, "UPDATE SeqCoord SET next = $1 WHERE ID = $2", next+num, 0); err != nil {
 		return fmt.Errorf("update seqcoord: %v", err)
 	}
 
@@ -1096,7 +1078,7 @@ func (s *mySQLSequencer) assignEntries(ctx context.Context, entries []*tessera.E
 // removed from the Seq table.
 //
 // Returns true if some entries were consumed as a weak signal that there may be further entries waiting to be consumed.
-func (s *mySQLSequencer) consumeEntries(ctx context.Context, limit uint64, f consumeFunc, forceUpdate bool) (bool, error) {
+func (s *postgresSequencer) consumeEntries(ctx context.Context, limit uint64, f consumeFunc, forceUpdate bool) (bool, error) {
 	tx, err := s.dbPool.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("failed to begin Tx: %v", err)
@@ -1110,7 +1092,7 @@ func (s *mySQLSequencer) consumeEntries(ctx context.Context, limit uint64, f con
 	}()
 
 	// Figure out which is the starting index of sequenced entries to start consuming from.
-	row := tx.QueryRowContext(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = ? FOR UPDATE", 0)
+	row := tx.QueryRowContext(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = $1 FOR UPDATE", 0)
 	var fromSeq uint64
 	var rootHash []byte
 	if err := row.Scan(&fromSeq, &rootHash); err == sql.ErrNoRows {
@@ -1121,7 +1103,7 @@ func (s *mySQLSequencer) consumeEntries(ctx context.Context, limit uint64, f con
 	klog.V(1).Infof("Consuming from %d", fromSeq)
 
 	// Now read the sequenced starting at the index we got above.
-	rows, err := tx.QueryContext(ctx, "SELECT seq, v FROM Seq WHERE id = ? AND seq >= ? ORDER BY seq LIMIT ? FOR UPDATE", 0, fromSeq, limit)
+	rows, err := tx.QueryContext(ctx, "SELECT seq, v FROM Seq WHERE id = $1 AND seq >= $2 ORDER BY seq LIMIT $3 FOR UPDATE", 0, fromSeq, limit)
 	if err != nil {
 		return false, fmt.Errorf("failed to read Seq: %v", err)
 	}
@@ -1169,15 +1151,15 @@ func (s *mySQLSequencer) consumeEntries(ctx context.Context, limit uint64, f con
 
 	// consumeFunc was successful, so we can update our coordination row, and delete the row(s) for
 	// the then consumed entries.
-	if _, err := tx.ExecContext(ctx, "UPDATE IntCoord SET seq=?, rootHash=? WHERE id=?", orderCheck, newRoot, 0); err != nil {
+	if _, err := tx.ExecContext(ctx, "UPDATE IntCoord SET seq=$1, rootHash=$2 WHERE id=$3", orderCheck, newRoot, 0); err != nil {
 		return false, fmt.Errorf("update intcoord: %v", err)
 	}
 
 	if len(seqsConsumed) > 0 {
 		// TODO(phboneff): evaluate if seq BETWEEN ? AND ? is more efficient
-		q := "DELETE FROM Seq WHERE id=? AND seq IN ( " + placeholder(len(seqsConsumed)) + " )"
+		q := "DELETE FROM Seq WHERE id=$1 AND seq IN ( " + placeholder(len(seqsConsumed), 2) + " )"
 		if _, err := tx.ExecContext(ctx, q, append([]any{0}, seqsConsumed...)...); err != nil {
-			return false, fmt.Errorf("update intcoord: %v", err)
+			return false, fmt.Errorf("delete seq: %v", err)
 		}
 	}
 
@@ -1190,8 +1172,8 @@ func (s *mySQLSequencer) consumeEntries(ctx context.Context, limit uint64, f con
 }
 
 // currentTree returns the size and root hash of the currently integrated tree.
-func (s *mySQLSequencer) currentTree(ctx context.Context) (uint64, []byte, error) {
-	row := s.dbPool.QueryRowContext(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = ?", 0)
+func (s *postgresSequencer) currentTree(ctx context.Context) (uint64, []byte, error) {
+	row := s.dbPool.QueryRowContext(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = $1", 0)
 	var fromSeq uint64
 	var rootHash []byte
 	if err := row.Scan(&fromSeq, &rootHash); err != nil {
@@ -1202,8 +1184,8 @@ func (s *mySQLSequencer) currentTree(ctx context.Context) (uint64, []byte, error
 }
 
 // nextIndex returns the next available index in the log.
-func (s *mySQLSequencer) nextIndex(ctx context.Context) (uint64, error) {
-	row := s.dbPool.QueryRowContext(ctx, "SELECT next FROM SeqCoord WHERE ID = ?", 0)
+func (s *postgresSequencer) nextIndex(ctx context.Context) (uint64, error) {
+	row := s.dbPool.QueryRowContext(ctx, "SELECT next FROM SeqCoord WHERE ID = $1", 0)
 	var nextSeq uint64
 	if err := row.Scan(&nextSeq); err != nil {
 		return 0, fmt.Errorf("failed to read DB: %v", err)
@@ -1217,7 +1199,7 @@ func (s *mySQLSequencer) nextIndex(ctx context.Context) (uint64, error) {
 //
 // This function uses PubCoord with an exclusive lock to guarantee that only one tessera instance can attempt to publish
 // a checkpoint at any given time.
-func (s *mySQLSequencer) publishCheckpoint(ctx context.Context, minStaleActive, minStaleRepub time.Duration, f func(context.Context, uint64, []byte) error) (errR error) {
+func (s *postgresSequencer) publishCheckpoint(ctx context.Context, minStaleActive, minStaleRepub time.Duration, f func(context.Context, uint64, []byte) error) (errR error) {
 	start := time.Now()
 	defer func() {
 		// Detect any errors and update metrics accordingly.
@@ -1237,7 +1219,7 @@ func (s *mySQLSequencer) publishCheckpoint(ctx context.Context, minStaleActive, 
 		}
 	}()
 
-	pRow := tx.QueryRowContext(ctx, "SELECT publishedAt, size FROM PubCoord WHERE id = ? FOR UPDATE", 0)
+	pRow := tx.QueryRowContext(ctx, "SELECT publishedAt, size FROM PubCoord WHERE id = $1 FOR UPDATE", 0)
 	var pubAt int64
 	var lastSize sql.NullInt64
 	if err := pRow.Scan(&pubAt, &lastSize); err != nil {
@@ -1250,7 +1232,7 @@ func (s *mySQLSequencer) publishCheckpoint(ctx context.Context, minStaleActive, 
 		return nil
 	}
 
-	row := tx.QueryRowContext(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = ?", 0)
+	row := tx.QueryRowContext(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = $1", 0)
 	var fromSeq uint64
 	var rootHash []byte
 	if err := row.Scan(&fromSeq, &rootHash); err != nil {
@@ -1281,7 +1263,7 @@ func (s *mySQLSequencer) publishCheckpoint(ctx context.Context, minStaleActive, 
 		return err
 	}
 
-	if _, err := tx.ExecContext(ctx, "UPDATE PubCoord SET publishedAt=?, size=? WHERE id=?", time.Now().Unix(), currentSize, 0); err != nil {
+	if _, err := tx.ExecContext(ctx, "UPDATE PubCoord SET publishedAt=$1, size=$2 WHERE id=$3", time.Now().Unix(), currentSize, 0); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1299,7 +1281,7 @@ func (s *mySQLSequencer) publishCheckpoint(ctx context.Context, minStaleActive, 
 //
 // Uses the `GCCoord` table to ensure that only one binary is actively garbage collecting at any given time, and to track progress so that we don't
 // needlessly attempt to GC over regions which have already been cleaned.
-func (s *mySQLSequencer) garbageCollect(ctx context.Context, treeSize uint64, maxBundles uint, deleteWithPrefix func(ctx context.Context, prefix string) error, entriesPath func(uint64, uint8) string) error {
+func (s *postgresSequencer) garbageCollect(ctx context.Context, treeSize uint64, maxBundles uint, deleteWithPrefix func(ctx context.Context, prefix string) error, entriesPath func(uint64, uint8) string) error {
 	tx, err := s.dbPool.Begin()
 	if err != nil {
 		return err
@@ -1309,7 +1291,7 @@ func (s *mySQLSequencer) garbageCollect(ctx context.Context, treeSize uint64, ma
 			_ = tx.Rollback()
 		}
 	}()
-	pRow := tx.QueryRowContext(ctx, "SELECT fromSize FROM GCCoord WHERE id = ? FOR UPDATE", 0)
+	pRow := tx.QueryRowContext(ctx, "SELECT fromSize FROM GCCoord WHERE id = $1 FOR UPDATE", 0)
 	var fromSize uint64
 	if err := pRow.Scan(&fromSize); err != nil {
 		return fmt.Errorf("failed to parse publishedAt: %v", err)
@@ -1352,7 +1334,7 @@ func (s *mySQLSequencer) garbageCollect(ctx context.Context, treeSize uint64, ma
 		return fmt.Errorf("failed to delete one or more objects: %v", err)
 	}
 
-	if _, err := tx.ExecContext(ctx, "UPDATE GCCoord SET fromSize=? WHERE id=?", fromSize, 0); err != nil {
+	if _, err := tx.ExecContext(ctx, "UPDATE GCCoord SET fromSize=$1 WHERE id=$2", fromSize, 0); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1369,10 +1351,10 @@ func isLastLeafInParent(i uint64) bool {
 	return i%layout.TileWidth == layout.TileWidth-1
 }
 
-func placeholder(n int) string {
+func placeholder(n int, offset int) string {
 	places := make([]string, n)
 	for i := range n {
-		places[i] = "?"
+		places[i] = fmt.Sprintf("$%d", i+offset)
 	}
 	return strings.Join(places, ",")
 }
@@ -1473,7 +1455,7 @@ func (s *s3Storage) setObjectIfNoneMatch(ctx context.Context, objName string, da
 
 // deleteObjectsWithPrefix removes any objects with the provided prefix from S3.
 func (s *s3Storage) deleteObjectsWithPrefix(ctx context.Context, objPrefix string) error {
-	ctx, span := tracer.Start(ctx, "tessera.storage.aws.deleteObject")
+	ctx, span := tracer.Start(ctx, "tessera.storage.postgres.deleteObject")
 	defer span.End()
 
 	if s.bucketPrefix != "" {
@@ -1511,6 +1493,6 @@ Qu80vNj7tiOe0lkdc8hwZK9YxavT0+FTP++vU6DUKvpEOr1+VGTk3IBXKSX9AHz5xXRgAQAA`
 	g, _ := base64.StdEncoding.DecodeString(d)
 	r, _ := gzip.NewReader(bytes.NewReader(g))
 	t, _ := io.ReadAll(r)
-	klog.Infof("Running in non-AWS mode - see storage/aws/README.md for more details.")
+	klog.Infof("Running in non-AWS mode - see storage/postgres/README.md for more details.")
 	klog.Infof("Here be dragons!\n%s", t)
 }
