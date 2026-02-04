@@ -32,7 +32,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"database/sql"
 	"encoding/base64"
 	"encoding/gob"
 	"errors"
@@ -51,6 +50,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/google/go-cmp/cmp"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/tessera"
 	"github.com/transparency-dev/tessera/api"
@@ -62,8 +63,6 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
-
-	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 const (
@@ -524,7 +523,7 @@ func (s *Storage) MigrationWriter(ctx context.Context, opts *tessera.MigrationOp
 // MigrationStorage implements the tessera.MigrationStorage lifecycle contract.
 type MigrationStorage struct {
 	s            *Storage
-	dbPool       *sql.DB
+	dbPool       *pgxpool.Pool
 	bundleHasher func([]byte) ([][]byte, error)
 	sequencer    sequencer
 	logStore     *logResourceStore
@@ -614,20 +613,20 @@ func (m *MigrationStorage) buildTree(ctx context.Context, sourceSize uint64) (ui
 	var newSize uint64
 	var newRoot []byte
 
-	tx, err := m.dbPool.BeginTx(ctx, nil)
+	tx, err := m.dbPool.Begin(ctx)
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to begin Tx: %v", err)
 	}
 	defer func() {
 		if tx != nil {
-			if err := tx.Rollback(); err != nil && err != sql.ErrTxDone {
+			if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
 				klog.Errorf("failed to rollback Tx: %v", err)
 			}
 		}
 	}()
 
 	// Figure out which is the starting index of sequenced entries to start consuming from.
-	row := tx.QueryRowContext(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = $1 FOR UPDATE", 0)
+	row := tx.QueryRow(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = $1 FOR UPDATE", 0)
 	var from uint64
 	var rootHash []byte
 	if err := row.Scan(&from, &rootHash); err != nil {
@@ -656,11 +655,11 @@ func (m *MigrationStorage) buildTree(ctx context.Context, sourceSize uint64) (ui
 	newSize = from + added
 	klog.Infof("Integrate: added %d entries", added)
 
-	if _, err := tx.ExecContext(ctx, "UPDATE IntCoord SET seq=$1, rootHash=$2 WHERE id=$3", newSize, newRoot, 0); err != nil {
+	if _, err := tx.Exec(ctx, "UPDATE IntCoord SET seq=$1, rootHash=$2 WHERE id=$3", newSize, newRoot, 0); err != nil {
 		return 0, nil, fmt.Errorf("update intcoord: %v", err)
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return 0, nil, fmt.Errorf("failed to commit Tx: %v", err)
 	}
 	tx = nil
@@ -837,26 +836,31 @@ func integrate(ctx context.Context, fromSeq uint64, lh [][]byte, lrs *logResourc
 // postgresSequencer uses Postgres to provide
 // a durable and thread/multi-process safe sequencer.
 type postgresSequencer struct {
-	dbPool         *sql.DB
+	dbPool         *pgxpool.Pool
 	maxOutstanding uint64
 }
 
 // newPostgresSequencer returns a new postgresSequencer struct which uses the provided
 // DSN for its Postgres connection.
 func newPostgresSequencer(ctx context.Context, dsn string, maxOutstanding uint64, maxOpenConns, maxIdleConns int) (*postgresSequencer, error) {
-	dbPool, err := sql.Open("pgx", dsn)
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse config: %v", err)
+	}
+
+	if maxOpenConns > 0 {
+		config.MaxConns = int32(maxOpenConns)
+	}
+	if maxIdleConns >= 0 {
+		config.MinConns = int32(maxIdleConns)
+	}
+
+	dbPool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Postgres db: %v", err)
 	}
 
-	if maxOpenConns > 0 {
-		dbPool.SetMaxOpenConns(maxOpenConns)
-	}
-	if maxIdleConns >= 0 {
-		dbPool.SetMaxIdleConns(maxIdleConns)
-	}
-
-	if err := dbPool.Ping(); err != nil {
+	if err := dbPool.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("failed to ping Postgres db: %v", err)
 	}
 
@@ -877,7 +881,7 @@ func newPostgresSequencer(ctx context.Context, dsn string, maxOutstanding uint64
 // checkDataCompatibility compares the Tessera library SchemaCompatibilityVersion with the one stored in the
 // database, and returns an error if they are not identical.
 func (s *postgresSequencer) checkDataCompatibility(ctx context.Context) error {
-	row := s.dbPool.QueryRowContext(ctx, "SELECT compatibilityVersion FROM Tessera WHERE id = 0")
+	row := s.dbPool.QueryRow(ctx, "SELECT compatibilityVersion FROM Tessera WHERE id = 0")
 	var gotVersion uint64
 	if err := row.Scan(&gotVersion); err != nil {
 		return fmt.Errorf("failed to read schema compatibility version from DB: %v", err)
@@ -908,7 +912,7 @@ func (s *postgresSequencer) checkDataCompatibility(ctx context.Context) error {
 //     This table coordinates integration of the batches of entries stored in
 //     Seq into the committed tree state.
 func (s *postgresSequencer) initDB(ctx context.Context) error {
-	if _, err := s.dbPool.ExecContext(ctx,
+	if _, err := s.dbPool.Exec(ctx,
 		`CREATE TABLE IF NOT EXISTS Tessera (
 			id INT NOT NULL,
 			compatibilityVersion BIGINT NOT NULL,
@@ -916,7 +920,7 @@ func (s *postgresSequencer) initDB(ctx context.Context) error {
 		)`); err != nil {
 		return err
 	}
-	if _, err := s.dbPool.ExecContext(ctx,
+	if _, err := s.dbPool.Exec(ctx,
 		`CREATE TABLE IF NOT EXISTS SeqCoord(
 			id INT NOT NULL,
 			next BIGINT NOT NULL,
@@ -926,7 +930,7 @@ func (s *postgresSequencer) initDB(ctx context.Context) error {
 	}
 	// TODO(phboneff): test this with very large leaves, consider downgrading to MEDIUMBLOB.
 	// Keep in mind that CT leaves can be large, as large as: https://crt.sh/?id=10751627.
-	if _, err := s.dbPool.ExecContext(ctx,
+	if _, err := s.dbPool.Exec(ctx,
 		`CREATE TABLE IF NOT EXISTS Seq(
 			id INT NOT NULL,
 			seq BIGINT NOT NULL,
@@ -935,7 +939,7 @@ func (s *postgresSequencer) initDB(ctx context.Context) error {
 		)`); err != nil {
 		return err
 	}
-	if _, err := s.dbPool.ExecContext(ctx,
+	if _, err := s.dbPool.Exec(ctx,
 		`CREATE TABLE IF NOT EXISTS IntCoord(
 			id INT NOT NULL,
 			seq BIGINT NOT NULL,
@@ -944,7 +948,7 @@ func (s *postgresSequencer) initDB(ctx context.Context) error {
 		)`); err != nil {
 		return err
 	}
-	if _, err := s.dbPool.ExecContext(ctx,
+	if _, err := s.dbPool.Exec(ctx,
 		`CREATE TABLE IF NOT EXISTS PubCoord(
 			id INT NOT NULL,
 			publishedAt BIGINT NOT NULL,
@@ -954,11 +958,11 @@ func (s *postgresSequencer) initDB(ctx context.Context) error {
 		return err
 	}
 
-	if _, err := s.dbPool.ExecContext(ctx, `ALTER TABLE PubCoord ADD COLUMN IF NOT EXISTS size BIGINT`); err != nil {
+	if _, err := s.dbPool.Exec(ctx, `ALTER TABLE PubCoord ADD COLUMN IF NOT EXISTS size BIGINT`); err != nil {
 		return fmt.Errorf("failed to add column to PubCoord: %v", err)
 	}
 
-	if _, err := s.dbPool.ExecContext(ctx,
+	if _, err := s.dbPool.Exec(ctx,
 		`CREATE TABLE IF NOT EXISTS GCCoord(
 			id INT NOT NULL,
 			fromSize BIGINT NOT NULL,
@@ -971,23 +975,23 @@ func (s *postgresSequencer) initDB(ctx context.Context) error {
 	// sequencing and integration to occur.
 	// Note that this will only succeed if no row exists, so there's no danger
 	// of "resetting" an existing log.
-	if _, err := s.dbPool.ExecContext(ctx,
+	if _, err := s.dbPool.Exec(ctx,
 		`INSERT INTO Tessera (id, compatibilityVersion) VALUES (0, $1) ON CONFLICT DO NOTHING`, SchemaCompatibilityVersion); err != nil {
 		return err
 	}
-	if _, err := s.dbPool.ExecContext(ctx,
+	if _, err := s.dbPool.Exec(ctx,
 		`INSERT INTO SeqCoord (id, next) VALUES (0, 0) ON CONFLICT DO NOTHING`); err != nil {
 		return err
 	}
-	if _, err := s.dbPool.ExecContext(ctx,
+	if _, err := s.dbPool.Exec(ctx,
 		`INSERT INTO IntCoord (id, seq, rootHash) VALUES (0, 0, $1) ON CONFLICT DO NOTHING`, rfc6962.DefaultHasher.EmptyRoot()); err != nil {
 		return err
 	}
-	if _, err := s.dbPool.ExecContext(ctx,
+	if _, err := s.dbPool.Exec(ctx,
 		`INSERT INTO PubCoord (id, publishedAt, size) VALUES (0, 0, 0) ON CONFLICT DO NOTHING`); err != nil {
 		return err
 	}
-	if _, err := s.dbPool.ExecContext(ctx,
+	if _, err := s.dbPool.Exec(ctx,
 		`INSERT INTO GCCoord (id, fromSize) VALUES (0, 0) ON CONFLICT DO NOTHING`); err != nil {
 		return err
 	}
@@ -1003,21 +1007,21 @@ func (s *postgresSequencer) assignEntries(ctx context.Context, entries []*tesser
 	// First grab the treeSize in a non-locking read-only fashion (we don't want to block/collide with integration).
 	// We'll use this value to determine whether we need to apply back-pressure.
 	var treeSize uint64
-	row := s.dbPool.QueryRowContext(ctx, "SELECT seq FROM IntCoord WHERE id = $1", 0)
-	if err := row.Scan(&treeSize); err == sql.ErrNoRows {
+	row := s.dbPool.QueryRow(ctx, "SELECT seq FROM IntCoord WHERE id = $1", 0)
+	if err := row.Scan(&treeSize); err == pgx.ErrNoRows {
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("failed to read integration coordination info: %v", err)
 	}
 
 	// Now move on with sequencing in a single transaction
-	tx, err := s.dbPool.BeginTx(ctx, nil)
+	tx, err := s.dbPool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin Tx: %v", err)
 	}
 	defer func() {
 		if tx != nil {
-			if err := tx.Rollback(); err != nil {
+			if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
 				klog.Errorf("failed to rollback Tx: %v", err)
 			}
 		}
@@ -1025,7 +1029,7 @@ func (s *postgresSequencer) assignEntries(ctx context.Context, entries []*tesser
 
 	// First we need to grab the next available sequence number from the SeqCoord table.
 	var next, id uint64
-	r := tx.QueryRowContext(ctx, "SELECT id, next FROM SeqCoord WHERE id = $1 FOR UPDATE", 0)
+	r := tx.QueryRow(ctx, "SELECT id, next FROM SeqCoord WHERE id = $1 FOR UPDATE", 0)
 	if err := r.Scan(&id, &next); err != nil {
 		return fmt.Errorf("failed to read seqcoord: %v", err)
 	}
@@ -1056,15 +1060,15 @@ func (s *postgresSequencer) assignEntries(ctx context.Context, entries []*tesser
 	num := uint64(len(entries))
 
 	// Insert our newly sequenced batch of entries into Seq,
-	if _, err := tx.ExecContext(ctx, "INSERT INTO Seq(id, seq, v) VALUES($1, $2, $3)", 0, next, data); err != nil {
+	if _, err := tx.Exec(ctx, "INSERT INTO Seq(id, seq, v) VALUES($1, $2, $3)", 0, next, data); err != nil {
 		return fmt.Errorf("insert into seq: %v", err)
 	}
 	// and update the next-available sequence number row in SeqCoord.
-	if _, err := tx.ExecContext(ctx, "UPDATE SeqCoord SET next = $1 WHERE ID = $2", next+num, 0); err != nil {
+	if _, err := tx.Exec(ctx, "UPDATE SeqCoord SET next = $1 WHERE ID = $2", next+num, 0); err != nil {
 		return fmt.Errorf("update seqcoord: %v", err)
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("failed to commit Tx: %v", err)
 	}
 	tx = nil
@@ -1079,23 +1083,23 @@ func (s *postgresSequencer) assignEntries(ctx context.Context, entries []*tesser
 //
 // Returns true if some entries were consumed as a weak signal that there may be further entries waiting to be consumed.
 func (s *postgresSequencer) consumeEntries(ctx context.Context, limit uint64, f consumeFunc, forceUpdate bool) (bool, error) {
-	tx, err := s.dbPool.BeginTx(ctx, nil)
+	tx, err := s.dbPool.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("failed to begin Tx: %v", err)
 	}
 	defer func() {
 		if tx != nil {
-			if err := tx.Rollback(); err != nil {
+			if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
 				klog.Errorf("failed to rollback Tx: %v", err)
 			}
 		}
 	}()
 
 	// Figure out which is the starting index of sequenced entries to start consuming from.
-	row := tx.QueryRowContext(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = $1 FOR UPDATE", 0)
+	row := tx.QueryRow(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = $1 FOR UPDATE", 0)
 	var fromSeq uint64
 	var rootHash []byte
-	if err := row.Scan(&fromSeq, &rootHash); err == sql.ErrNoRows {
+	if err := row.Scan(&fromSeq, &rootHash); err == pgx.ErrNoRows {
 		return false, nil
 	} else if err != nil {
 		return false, fmt.Errorf("failed to read IntCoord: %v", err)
@@ -1103,15 +1107,11 @@ func (s *postgresSequencer) consumeEntries(ctx context.Context, limit uint64, f 
 	klog.V(1).Infof("Consuming from %d", fromSeq)
 
 	// Now read the sequenced starting at the index we got above.
-	rows, err := tx.QueryContext(ctx, "SELECT seq, v FROM Seq WHERE id = $1 AND seq >= $2 ORDER BY seq LIMIT $3 FOR UPDATE", 0, fromSeq, limit)
+	rows, err := tx.Query(ctx, "SELECT seq, v FROM Seq WHERE id = $1 AND seq >= $2 ORDER BY seq LIMIT $3 FOR UPDATE", 0, fromSeq, limit)
 	if err != nil {
 		return false, fmt.Errorf("failed to read Seq: %v", err)
 	}
-	defer func() {
-		if err := rows.Close(); err != nil {
-			klog.Warningf("rows.Close: %v", err)
-		}
-	}()
+	defer rows.Close()
 
 	// This needs to be of type `any`, to be passed to ExecContext. Only uint64s will be stored.
 	seqsConsumed := []any{}
@@ -1151,19 +1151,19 @@ func (s *postgresSequencer) consumeEntries(ctx context.Context, limit uint64, f 
 
 	// consumeFunc was successful, so we can update our coordination row, and delete the row(s) for
 	// the then consumed entries.
-	if _, err := tx.ExecContext(ctx, "UPDATE IntCoord SET seq=$1, rootHash=$2 WHERE id=$3", orderCheck, newRoot, 0); err != nil {
+	if _, err := tx.Exec(ctx, "UPDATE IntCoord SET seq=$1, rootHash=$2 WHERE id=$3", orderCheck, newRoot, 0); err != nil {
 		return false, fmt.Errorf("update intcoord: %v", err)
 	}
 
 	if len(seqsConsumed) > 0 {
 		// TODO(phboneff): evaluate if seq BETWEEN ? AND ? is more efficient
 		q := "DELETE FROM Seq WHERE id=$1 AND seq IN ( " + placeholder(len(seqsConsumed), 2) + " )"
-		if _, err := tx.ExecContext(ctx, q, append([]any{0}, seqsConsumed...)...); err != nil {
+		if _, err := tx.Exec(ctx, q, append([]any{0}, seqsConsumed...)...); err != nil {
 			return false, fmt.Errorf("delete seq: %v", err)
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("failed to commit Tx: %v", err)
 	}
 	tx = nil
@@ -1173,7 +1173,7 @@ func (s *postgresSequencer) consumeEntries(ctx context.Context, limit uint64, f 
 
 // currentTree returns the size and root hash of the currently integrated tree.
 func (s *postgresSequencer) currentTree(ctx context.Context) (uint64, []byte, error) {
-	row := s.dbPool.QueryRowContext(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = $1", 0)
+	row := s.dbPool.QueryRow(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = $1", 0)
 	var fromSeq uint64
 	var rootHash []byte
 	if err := row.Scan(&fromSeq, &rootHash); err != nil {
@@ -1185,7 +1185,7 @@ func (s *postgresSequencer) currentTree(ctx context.Context) (uint64, []byte, er
 
 // nextIndex returns the next available index in the log.
 func (s *postgresSequencer) nextIndex(ctx context.Context) (uint64, error) {
-	row := s.dbPool.QueryRowContext(ctx, "SELECT next FROM SeqCoord WHERE ID = $1", 0)
+	row := s.dbPool.QueryRow(ctx, "SELECT next FROM SeqCoord WHERE ID = $1", 0)
 	var nextSeq uint64
 	if err := row.Scan(&nextSeq); err != nil {
 		return 0, fmt.Errorf("failed to read DB: %v", err)
@@ -1209,19 +1209,21 @@ func (s *postgresSequencer) publishCheckpoint(ctx context.Context, minStaleActiv
 		}
 	}()
 
-	tx, err := s.dbPool.Begin()
+	tx, err := s.dbPool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() {
 		if tx != nil {
-			_ = tx.Rollback()
+			if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+				klog.Errorf("failed to rollback Tx: %v", err)
+			}
 		}
 	}()
 
-	pRow := tx.QueryRowContext(ctx, "SELECT publishedAt, size FROM PubCoord WHERE id = $1 FOR UPDATE", 0)
+	pRow := tx.QueryRow(ctx, "SELECT publishedAt, size FROM PubCoord WHERE id = $1 FOR UPDATE", 0)
 	var pubAt int64
-	var lastSize sql.NullInt64
+	var lastSize *int64
 	if err := pRow.Scan(&pubAt, &lastSize); err != nil {
 		return fmt.Errorf("failed to parse PubCoord: %v", err)
 	}
@@ -1232,7 +1234,7 @@ func (s *postgresSequencer) publishCheckpoint(ctx context.Context, minStaleActiv
 		return nil
 	}
 
-	row := tx.QueryRowContext(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = $1", 0)
+	row := tx.QueryRow(ctx, "SELECT seq, rootHash FROM IntCoord WHERE id = $1", 0)
 	var fromSeq uint64
 	var rootHash []byte
 	if err := row.Scan(&fromSeq, &rootHash); err != nil {
@@ -1243,10 +1245,10 @@ func (s *postgresSequencer) publishCheckpoint(ctx context.Context, minStaleActiv
 	shouldPublish := minStaleRepub > 0 && cpAge >= minStaleRepub
 
 	if !shouldPublish {
-		if !lastSize.Valid {
+		if lastSize == nil {
 			// If we don't know the last published size, we should probably publish to be safe/self-heal.
 			shouldPublish = true
-		} else if currentSize > uint64(lastSize.Int64) {
+		} else if currentSize > uint64(*lastSize) {
 			shouldPublish = true
 		}
 	}
@@ -1263,10 +1265,10 @@ func (s *postgresSequencer) publishCheckpoint(ctx context.Context, minStaleActiv
 		return err
 	}
 
-	if _, err := tx.ExecContext(ctx, "UPDATE PubCoord SET publishedAt=$1, size=$2 WHERE id=$3", time.Now().Unix(), currentSize, 0); err != nil {
+	if _, err := tx.Exec(ctx, "UPDATE PubCoord SET publishedAt=$1, size=$2 WHERE id=$3", time.Now().Unix(), currentSize, 0); err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
 	opsHistogram.Record(ctx, time.Since(start).Milliseconds(), metric.WithAttributes(opNameKey.String("publishCheckpoint")))
@@ -1282,16 +1284,16 @@ func (s *postgresSequencer) publishCheckpoint(ctx context.Context, minStaleActiv
 // Uses the `GCCoord` table to ensure that only one binary is actively garbage collecting at any given time, and to track progress so that we don't
 // needlessly attempt to GC over regions which have already been cleaned.
 func (s *postgresSequencer) garbageCollect(ctx context.Context, treeSize uint64, maxBundles uint, deleteWithPrefix func(ctx context.Context, prefix string) error, entriesPath func(uint64, uint8) string) error {
-	tx, err := s.dbPool.Begin()
+	tx, err := s.dbPool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() {
 		if tx != nil {
-			_ = tx.Rollback()
+			_ = tx.Rollback(ctx)
 		}
 	}()
-	pRow := tx.QueryRowContext(ctx, "SELECT fromSize FROM GCCoord WHERE id = $1 FOR UPDATE", 0)
+	pRow := tx.QueryRow(ctx, "SELECT fromSize FROM GCCoord WHERE id = $1 FOR UPDATE", 0)
 	var fromSize uint64
 	if err := pRow.Scan(&fromSize); err != nil {
 		return fmt.Errorf("failed to parse publishedAt: %v", err)
@@ -1334,10 +1336,10 @@ func (s *postgresSequencer) garbageCollect(ctx context.Context, treeSize uint64,
 		return fmt.Errorf("failed to delete one or more objects: %v", err)
 	}
 
-	if _, err := tx.ExecContext(ctx, "UPDATE GCCoord SET fromSize=$1 WHERE id=$2", fromSize, 0); err != nil {
+	if _, err := tx.Exec(ctx, "UPDATE GCCoord SET fromSize=$1 WHERE id=$2", fromSize, 0); err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
 	tx = nil

@@ -25,7 +25,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -39,6 +38,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/google/go-cmp/cmp"
+	"github.com/jackc/pgx/v5"
 	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/tessera"
 	"github.com/transparency-dev/tessera/api"
@@ -47,8 +47,6 @@ import (
 	storage "github.com/transparency-dev/tessera/storage/internal"
 	"golang.org/x/mod/sumdb/note"
 	"k8s.io/klog/v2"
-
-	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 var (
@@ -73,7 +71,7 @@ func TestMain(m *testing.M) {
 func canSkipPostgresTest(t *testing.T, ctx context.Context) bool {
 	t.Helper()
 
-	db, err := sql.Open("pgx", *postgresURI)
+	conn, err := pgx.Connect(ctx, *postgresURI)
 	if err != nil {
 		if *isPostgresTestOptional {
 			return true
@@ -81,11 +79,11 @@ func canSkipPostgresTest(t *testing.T, ctx context.Context) bool {
 		t.Fatalf("failed to open Postgres test db: %v", err)
 	}
 	defer func() {
-		if err := db.Close(); err != nil {
+		if err := conn.Close(ctx); err != nil {
 			t.Fatalf("failed to close Postgres database: %v", err)
 		}
 	}()
-	if err := db.PingContext(ctx); err != nil {
+	if err := conn.Ping(ctx); err != nil {
 		if *isPostgresTestOptional {
 			return true
 		}
@@ -99,17 +97,17 @@ func canSkipPostgresTest(t *testing.T, ctx context.Context) bool {
 func mustDropTables(t *testing.T, ctx context.Context) {
 	t.Helper()
 
-	db, err := sql.Open("pgx", *postgresURI)
+	conn, err := pgx.Connect(ctx, *postgresURI)
 	if err != nil {
 		t.Fatalf("failed to connect to db: %v", *postgresURI)
 	}
 	defer func() {
-		if err := db.Close(); err != nil {
+		if err := conn.Close(ctx); err != nil {
 			t.Fatalf("failed to close db: %v", err)
 		}
 	}()
 
-	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS Seq, SeqCoord, IntCoord, PubCoord, GCCoord, Tessera"); err != nil {
+	if _, err := conn.Exec(ctx, "DROP TABLE IF EXISTS Seq, SeqCoord, IntCoord, PubCoord, GCCoord, Tessera"); err != nil {
 		t.Fatalf("failed to drop all tables: %v", err)
 	}
 }
@@ -489,9 +487,7 @@ func TestGarbageCollect(t *testing.T) {
 		t.Fatalf("newPostgresSequencer: %v", err)
 	}
 	defer func() {
-		if err := s.dbPool.Close(); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		s.dbPool.Close()
 	}()
 
 	sk, vk := mustGenerateKeys(t)
@@ -608,9 +604,7 @@ func TestGarbageCollectOption(t *testing.T) {
 				t.Fatalf("newPostgresSequencer: %v", err)
 			}
 			defer func() {
-				if err := s.dbPool.Close(); err != nil {
-					t.Fatalf("Close: %v", err)
-				}
+				s.dbPool.Close()
 			}()
 
 			sk, vk := mustGenerateKeys(t)
