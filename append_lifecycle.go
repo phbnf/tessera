@@ -43,6 +43,8 @@ const (
 	DefaultBatchMaxSize = 256
 	// DefaultBatchMaxAge is used by storage implementations if no WithBatching option is provided when instantiating it.
 	DefaultBatchMaxAge = 250 * time.Millisecond
+	// DefaultIntegrationInterval is used by storage implementations if no WithIntegrationInterval option is provided when instantiating it.
+	DefaultIntegrationInterval = 1 * time.Second
 	// DefaultCheckpointInterval is used by storage implementations if no WithCheckpointInterval option is provided when instantiating it.
 	DefaultCheckpointInterval = 10 * time.Second
 	// DefaultCheckpointRepublishInterval is used by storage implementations if no WithCheckpointRepublishInterval option is provided when instantiating it.
@@ -578,6 +580,7 @@ func NewAppendOptions() *AppendOptions {
 		entriesPath:                 layout.EntriesPath,
 		maxEntrySize:                DefaultEntrySizeLimit,
 		bundleIDHasher:              defaultIDHasher,
+		integrationInterval:         DefaultIntegrationInterval,
 		checkpointInterval:          DefaultCheckpointInterval,
 		checkpointRepublishInterval: DefaultCheckpointRepublishInterval,
 		addDecorators:               make([]func(AddFn) AddFn, 0),
@@ -815,6 +818,25 @@ func (o *AppendOptions) WithBatching(maxSize uint, maxAge time.Duration) *Append
 // assigned, but which are not yet integrated into the log.
 func (o *AppendOptions) WithPushback(maxOutstanding uint) *AppendOptions {
 	o.pushbackMaxOutstanding = maxOutstanding
+	return o
+}
+
+// WithIntegrationInterval configures the frequency at which Tessera will attempt to integrate new entries.
+// new checkpoints.
+//
+// Well behaved clients of the log will only "see" newly sequenced entries once a new checkpoint is published,
+// so it's important to set that value such that it works well with your ecosystem.
+//
+// Regularly publishing new checkpoints:
+//   - helps show that the log is "live", even if no entries are being added.
+//   - enables clients of the log to reason about how frequently they need to have their
+//     view of the log refreshed, which in turn helps reduce work/load across the ecosystem.
+//
+// Note that this option probably only makes sense for long-lived applications (e.g. HTTP servers).
+//
+// If this option isn't provided, storage implementations will use the DefaultCheckpointInterval const above.
+func (o *AppendOptions) WithIntegrationInterval(interval time.Duration) *AppendOptions {
+	o.checkpointInterval = interval
 	return o
 }
 
