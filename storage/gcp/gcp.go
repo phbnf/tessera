@@ -129,7 +129,7 @@ type sequencer interface {
 	// nextIndex returns the next available index in the log.
 	nextIndex(ctx context.Context) (uint64, error)
 	// publishCheckpoint coordinates the publication of new checkpoints based on the current integrated tree.
-	publishCheckpoint(ctx context.Context, minStaleActive, minStaleRepub time.Duration, f func(ctx context.Context, size uint64, root []byte) error) error
+	publishCheckpoint(ctx context.Context, minStaleActive, minStaleRepub time.Duration, f func(ctx context.Context, size uint64, root []byte) error) (time.Time, error)
 	// garbageCollect coordinates the removal of unneeded partial tiles/entry bundles for the provided tree size, up to a maximum number of deletes per invocation.
 	garbageCollect(ctx context.Context, treeSize uint64, maxDeletes uint, removePrefix func(ctx context.Context, prefix string) error, entriesPath func(uint64, uint8) string) error
 }
@@ -372,12 +372,22 @@ func (a *Appender) publishCheckpointJob(ctx context.Context, pubInterval, republ
 			ctx, cancel := context.WithTimeout(ctx, defaultPublicationTimeout)
 			defer cancel() // Note: ok because we're in a func passed to TraceErr here!
 
-			if err := a.sequencer.publishCheckpoint(ctx, pubInterval, republishInterval, a.updateCheckpoint); err != nil {
+			publishedAt, err := a.sequencer.publishCheckpoint(ctx, pubInterval, republishInterval, a.updateCheckpoint)
+			fmt.Println(publishedAt)
+			if err != nil {
+				t.Reset(pubInterval)
 				return fmt.Errorf("publishCheckpoint failed: %v", err)
+			}
+			nextPublication := pubInterval - time.Since(publishedAt)
+			if nextPublication <= 0 {
+				t.Reset(time.Millisecond) // Schedule a checkpoint update immediately.
+			} else {
+				t.Reset(nextPublication)
 			}
 			return nil
 		}, trace.WithAttributes(otel.PeriodicKey.Bool(true))); err != nil {
 			slog.ErrorContext(ctx, "publishCheckpoint failed", slog.Any("error", err))
+			t.Reset(pubInterval)
 		}
 	}
 }
@@ -1081,13 +1091,14 @@ func (s *spannerCoordinator) nextIndex(ctx context.Context) (uint64, error) {
 //
 // This function uses PubCoord with an exclusive lock to guarantee that only one tessera instance can attempt to publish
 // a checkpoint at any given time.
-func (s *spannerCoordinator) publishCheckpoint(ctx context.Context, minStaleActive, minStaleRepub time.Duration, f func(context.Context, uint64, []byte) error) error {
+func (s *spannerCoordinator) publishCheckpoint(ctx context.Context, minStaleActive, minStaleRepub time.Duration, f func(context.Context, uint64, []byte) error) (time.Time, error) {
+	var publishedAt time.Time
 	currentSize, rootHash, err := s.currentTree(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get current tree: %v", err)
+		return time.Time{}, fmt.Errorf("failed to get current tree: %v", err)
 	}
 
-	return otel.TraceErr(ctx, "tessera.storage.gcp.publishCheckpoint", tracer, func(ctx context.Context, span trace.Span) error {
+	return publishedAt, otel.TraceErr(ctx, "tessera.storage.gcp.publishCheckpoint", tracer, func(ctx context.Context, span trace.Span) error {
 		// outcomeAttr records the outcome of the checkpoint publication attempt for metrics and traces.
 		var outcomeAttr attribute.KeyValue
 		start := time.Now()
@@ -1134,6 +1145,7 @@ func (s *spannerCoordinator) publishCheckpoint(ctx context.Context, minStaleActi
 			if !shouldPublish {
 				slog.DebugContext(ctx, "publishCheckpoint: skipping publish because tree hasn't grown and previous checkpoint is too recent")
 				outcomeAttr = outcomeTypeKey.String("skipped_no_growth")
+				publishedAt = pubAt
 				return nil
 			}
 
@@ -1144,7 +1156,9 @@ func (s *spannerCoordinator) publishCheckpoint(ctx context.Context, minStaleActi
 				return err
 			}
 			span.AddEvent("Updating PubCoord")
-			if err := txn.BufferWrite([]*spanner.Mutation{spanner.Update("PubCoord", []string{"id", "publishedAt", "size"}, []any{0, time.Now(), int64(currentSize)})}); err != nil {
+			publishedAt = time.Now()
+			if err := txn.BufferWrite([]*spanner.Mutation{spanner.Update("PubCoord", []string{"id", "publishedAt", "size"}, []any{0, publishedAt, int64(currentSize)})}); err != nil {
+				publishedAt = time.Time{}
 				return err
 			}
 
