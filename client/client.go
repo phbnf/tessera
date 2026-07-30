@@ -248,7 +248,6 @@ func (pb *ProofBuilder) SubtreeInclusionProof(ctx context.Context, index, start,
 		return pb.materialiseProof(ctx, nodes)
 	})
 }
-
 // materialiseProof retrieves the specified proof nodes via pb's nodeCache, recreating ephemeral nodes if necessary.
 func (pb *ProofBuilder) materialiseProof(ctx context.Context, nodes proof.Nodes) ([][]byte, error) {
 	hashes, err := pb.nodeCache.GetNodes(ctx, nodes.IDs)

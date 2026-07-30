@@ -26,6 +26,8 @@ import (
 
 	"github.com/transparency-dev/formats/note"
 	"github.com/transparency-dev/tessera"
+	"github.com/transparency-dev/tessera/api/layout"
+	"github.com/transparency-dev/tessera/client"
 	"github.com/transparency-dev/tessera/cmd/mtc/log/internal/entry"
 	"github.com/transparency-dev/tessera/cmd/mtc/log/internal/landmark"
 	"github.com/transparency-dev/tessera/internal/parse"
@@ -37,9 +39,12 @@ const (
 	// DefaultAwaiterPollInterval is the fallback polling period for the publication awaiter.
 	DefaultAwaiterPollInterval = 200 * time.Millisecond
 
-	// SPEC: CQRP Policy v0.2.0
+	// DefaultLandmarkCheckpointCacheTTL is the duration for which a fetched checkpoint size is cached locally for landmark queries.
+	DefaultLandmarkCheckpointCacheTTL = 5 * time.Second
+
+	// SPEC: CQRP Policy v0.2.0.
 	// "MTC CA Operators MUST NOT issue Subscriber certificates with a
-	// validity period exceeding 47 days."
+	//  validity period exceeding 47 days."
 	DefaultMaxCertLifetime = 47 * 24 * time.Hour
 )
 
@@ -76,18 +81,21 @@ const (
 
 // Options holds settings for configuring MTCLog instances.
 type Options struct {
-	reader           tessera.LogReader
-	pollPeriod       time.Duration
-	landmarkStorage  landmark.LandmarksStorage
-	landmarkInterval time.Duration
-	maxCertLifetime  time.Duration
+	reader                     tessera.LogReader
+	pollPeriod                 time.Duration
+	landmarkStorage            landmark.LandmarksStorage
+	landmarkInterval           time.Duration
+	landmarkCheckpointCacheTTL time.Duration
+	maxCertLifetime            time.Duration
 }
+
 
 // NewOptions creates a new options struct for configuring MTCLog instances.
 func NewOptions() *Options {
 	return &Options{
-		pollPeriod:      DefaultAwaiterPollInterval,
-		maxCertLifetime: DefaultMaxCertLifetime,
+		pollPeriod:                 DefaultAwaiterPollInterval,
+		landmarkCheckpointCacheTTL: DefaultLandmarkCheckpointCacheTTL,
+		maxCertLifetime:            DefaultMaxCertLifetime,
 	}
 }
 
@@ -101,6 +109,9 @@ func (o *Options) valid() error {
 	}
 	if o.landmarkInterval < 0 {
 		return errors.New("invalid Options: WithLandmarkInterval must be >= 0")
+	}
+	if o.landmarkCheckpointCacheTTL <= 0 {
+		return errors.New("invalid Options: WithLandmarkCheckpointCacheTTL must be strictly positive (> 0)")
 	}
 	if o.pollPeriod < 0 {
 		return errors.New("invalid Options: pollPeriod must be >= 0")
@@ -143,6 +154,13 @@ func (o *Options) WithLandmarkInterval(duration time.Duration) *Options {
 	return o
 }
 
+// WithLandmarkCheckpointCacheTTL configures the in-memory cache TTL for checkpoint size queries used by the landmark manager.
+// duration MUST be strictly positive (> 0). If unset, defaults to DefaultLandmarkCheckpointCacheTTL (5s).
+func (o *Options) WithLandmarkCheckpointCacheTTL(duration time.Duration) *Options {
+	o.landmarkCheckpointCacheTTL = duration
+	return o
+}
+
 // WithMaxCertLifetime configures a maximum validity duration for incoming certificates.
 // duration MUST be strictly positive and smaller than or equal to 47 days.
 //
@@ -164,7 +182,49 @@ type MTCLog struct {
 
 // MTCProof represents an MTC inclusion proof as per
 // draft-ietf-plants-merkle-tree-certs section 6.2.
-type MTCProof struct{}
+type MTCProof struct {
+	Extensions     []byte   `json:"extensions,omitempty"`
+	Start          uint64   `json:"start,omitempty"`
+	End            uint64   `json:"end,omitempty"`
+	InclusionProof [][]byte `json:"inclusionProof,omitempty"`
+	Signatures     [][]byte `json:"signatures,omitempty"`
+}
+
+// Marshal TLS encodes MTCProof per draft-ietf-plants-merkle-tree-certs section 6.2.
+func (p MTCProof) Marshal() ([]byte, error) {
+	var b cryptobyte.Builder
+
+	// MTCLogEntryExtension extensions<0..2^16-1>
+	b.AddUint16LengthPrefixed(func(child *cryptobyte.Builder) {
+		child.AddBytes(p.Extensions)
+	})
+
+	// uint48 start
+	b.AddUint16(uint16(p.Start >> 32))
+	b.AddUint32(uint32(p.Start))
+
+	// uint48 end
+	b.AddUint16(uint16(p.End >> 32))
+	b.AddUint32(uint32(p.End))
+
+	// HashValue inclusion_proof<0..2^16-1>
+	b.AddUint16LengthPrefixed(func(child *cryptobyte.Builder) {
+		for _, h := range p.InclusionProof {
+			child.AddBytes(h)
+		}
+	})
+
+	// SubtreeSignature signatures<0..2^16-1>
+	b.AddUint16LengthPrefixed(func(child *cryptobyte.Builder) {
+		for _, sig := range p.Signatures {
+			child.AddUint16LengthPrefixed(func(s *cryptobyte.Builder) {
+				s.AddBytes(sig)
+			})
+		}
+	})
+
+	return b.Bytes()
+}
 
 // AddTBSRsp contains enough information from the log
 // to build a standalone certificate.
@@ -187,6 +247,15 @@ type TBSCertificateLogEntry struct {
 	Extensions                []byte `json:"extensions,omitempty"`      // Optional raw EXPLICIT SEQUENCE bytes, tag 3
 }
 
+type ProofToLandmarkReq struct {
+	Index uint64 `json:"index"`
+}
+type ProofToLandmarkRsp struct {
+	MTCProof   MTCProof      `json:"mtcProof"`
+	TooOld     bool          `json:"tooOld"`
+	RetryAfter time.Duration `json:"retryAfter"`
+}
+
 type validity struct {
 	NotBefore time.Time
 	NotAfter  time.Time
@@ -196,7 +265,7 @@ func parseValidity(data []byte) (validity, error) {
 	var v validity
 	rest, err := stdasn1.Unmarshal(data, &v)
 	if err != nil {
-		return validity{}, fmt.Errorf("unmarshal validity: %w", err)
+		return validity{}, fmt.Errorf("unmarshal validity: %v", err)
 	}
 	if len(rest) > 0 {
 		return validity{}, errors.New("trailing bytes in validity SEQUENCE")
@@ -390,7 +459,7 @@ func NewMTCLog(ctx context.Context, a *tessera.Appender, opts *Options) (*MTCLog
 		)
 	}
 
-	pub, err := landmark.NewPublisher(ctx, l.readCheckpointSize, opts.landmarkStorage, opts.maxCertLifetime, interval)
+	pub, err := landmark.NewPublisher(ctx, l.readCheckpointSize, opts.landmarkStorage, opts.maxCertLifetime, interval, opts.landmarkCheckpointCacheTTL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialise landmark publisher: %w", err)
 	}
@@ -425,7 +494,7 @@ func (l *MTCLog) AddTBS(ctx context.Context, tbs TBSCertificateLogEntry) (*AddTB
 
 	// TODO: get subtree cosignatures
 	// TODO: build MTCProof
-
+	
 	return &AddTBSRsp{
 		Index:    idx.Index,
 		MTCProof: MTCProof{},
@@ -435,11 +504,45 @@ func (l *MTCLog) AddTBS(ctx context.Context, tbs TBSCertificateLogEntry) (*AddTB
 // ProofToLandmark builds an MTCProof for the entry at idx to a
 // published landmark.
 // TODO: better arg
-func (l *MTCLog) ProofToLandmark(ctx context.Context, idx uint64) (MTCProof, error) {
-	// TODO check if landmark is available
-	//   If available, build and return an MTCProof
-	//   If not, return a clever error
-	return MTCProof{}, nil
+func (l *MTCLog) ProofToLandmark(ctx context.Context, idx ProofToLandmarkReq) (ProofToLandmarkRsp, error) {
+	start, end, retryAfter, err := l.landmarkPublisher.GetSubtreeFor(ctx, idx.Index)
+	switch {
+	case errors.Is(err, landmark.ErrTooOld):
+		return ProofToLandmarkRsp{TooOld: true}, nil
+	case err != nil:
+		return ProofToLandmarkRsp{}, fmt.Errorf("get subtree for index %d: %w", idx.Index, err)
+	case retryAfter > 0:
+		return ProofToLandmarkRsp{RetryAfter: retryAfter}, nil
+	}
+	if l.reader == nil {
+		return ProofToLandmarkRsp{}, errors.New("log reader is not configured")
+	}
+	pb, err := client.NewProofBuilder(ctx, end, l.reader.ReadTile)
+	if err != nil {
+		return ProofToLandmarkRsp{}, fmt.Errorf("cannot create proof builder")
+	}
+	proofNodes, err := pb.SubtreeInclusionProof(ctx, idx.Index, start, end)
+	if err != nil {
+		return ProofToLandmarkRsp{}, fmt.Errorf("cannot get subtree inclusion proof for index %d in subtree [%d, %d): %v", idx.Index, start, end, err)
+	}
+
+	// SPEC: draft-ietf-plants-merkle-tree-certs Section 6.2
+	// "extensions MUST contain the log entry's extensions value (Section 5.2.1)."
+	var extBytes []byte
+	bundleIndex := idx.Index / layout.EntryBundleWidth
+	entryOffset := idx.Index % layout.EntryBundleWidth
+	if eb, err := client.GetEntryBundle(ctx, l.reader.ReadEntryBundle, bundleIndex, end); err == nil && uint64(len(eb.Entries)) > entryOffset {
+		extBytes, _ = entry.ExtractExtensions(eb.Entries[entryOffset])
+	}
+
+	return ProofToLandmarkRsp{
+		MTCProof: MTCProof{
+			Extensions:     extBytes,
+			Start:          start,
+			End:            end,
+			InclusionProof: proofNodes,
+		},
+	}, nil
 }
 
 // formatOriginAndSigner generates valid MTC origin and signerName.

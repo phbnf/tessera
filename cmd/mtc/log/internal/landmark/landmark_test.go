@@ -17,6 +17,7 @@ package landmark
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"reflect"
 	"sync"
@@ -314,7 +315,7 @@ func TestPublisher_Initialise(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			loopCtx, cancelLoop := context.WithCancel(ctx)
 			memStorage := &mockStorage{data: tc.initialData}
-			_, err := NewPublisher(loopCtx, func(ctx context.Context) (uint64, error) { return 0, nil }, memStorage, 24*time.Hour, 1*time.Hour)
+			_, err := NewPublisher(loopCtx, func(ctx context.Context) (uint64, error) { return 0, nil }, memStorage, 24*time.Hour, 1*time.Hour, 5*time.Second)
 			if err != nil {
 				t.Fatalf("NewPublisher() error: %v", err)
 			}
@@ -345,7 +346,7 @@ func TestPublisher_Update(t *testing.T) {
 
 	memStorage := &mockStorage{}
 	// maxCertLifetime = 1h, pubInterval = 1h => maxActive = ceil(1/1) + 1 = 2
-	pub, err := NewPublisher(loopCtx, readCheckpointSize, memStorage, 1*time.Hour, 1*time.Hour)
+	pub, err := NewPublisher(loopCtx, readCheckpointSize, memStorage, 1*time.Hour, 1*time.Hour, 5*time.Second)
 	if err != nil {
 		t.Fatalf("NewPublisher() error: %v", err)
 	}
@@ -454,6 +455,7 @@ func TestNewPublisher(t *testing.T) {
 		storage            LandmarksStorage
 		maxCertLifetime    time.Duration
 		pubInterval        time.Duration
+		cacheTTL           time.Duration
 		wantErr            bool
 		wantMaxActive      uint64
 	}{
@@ -463,6 +465,7 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    24 * time.Hour,
 			pubInterval:        1 * time.Hour,
+			cacheTTL:           5 * time.Second,
 			wantMaxActive:      25, // ceil(24/1) + 1 = 25
 		},
 		{
@@ -471,6 +474,7 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    25 * time.Hour,
 			pubInterval:        2 * time.Hour,
+			cacheTTL:           5 * time.Second,
 			wantMaxActive:      14, // ceil(12.5) + 1 = 13 + 1 = 14
 		},
 		{
@@ -479,6 +483,7 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    1 * time.Hour,
 			pubInterval:        1 * time.Hour,
+			cacheTTL:           5 * time.Second,
 			wantMaxActive:      2, // ceil(1/1) + 1 = 2
 		},
 		{
@@ -487,6 +492,7 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    47 * 24 * time.Hour,
 			pubInterval:        4 * time.Hour,
+			cacheTTL:           5 * time.Second,
 			wantMaxActive:      283, // ceil(1128/4) + 1 = 283
 		},
 		{
@@ -495,6 +501,7 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    10 * time.Minute,
 			pubInterval:        15 * time.Minute,
+			cacheTTL:           5 * time.Second,
 			wantErr:            true,
 		},
 		{
@@ -503,6 +510,7 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    47 * 24 * time.Hour,
 			pubInterval:        1 * time.Hour,
+			cacheTTL:           5 * time.Second,
 			wantErr:            true,
 		},
 		{
@@ -511,6 +519,7 @@ func TestNewPublisher(t *testing.T) {
 			storage:            nil,
 			maxCertLifetime:    24 * time.Hour,
 			pubInterval:        1 * time.Hour,
+			cacheTTL:           5 * time.Second,
 			wantErr:            true,
 		},
 		{
@@ -519,6 +528,7 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    24 * time.Hour,
 			pubInterval:        1 * time.Hour,
+			cacheTTL:           5 * time.Second,
 			wantErr:            true,
 		},
 		{
@@ -527,6 +537,7 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    0,
 			pubInterval:        1 * time.Hour,
+			cacheTTL:           5 * time.Second,
 			wantErr:            true,
 		},
 		{
@@ -535,6 +546,7 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    -1 * time.Hour,
 			pubInterval:        1 * time.Hour,
+			cacheTTL:           5 * time.Second,
 			wantErr:            true,
 		},
 		{
@@ -543,6 +555,7 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    24 * time.Hour,
 			pubInterval:        0,
+			cacheTTL:           5 * time.Second,
 			wantErr:            true,
 		},
 		{
@@ -551,13 +564,32 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    24 * time.Hour,
 			pubInterval:        -1 * time.Hour,
+			cacheTTL:           5 * time.Second,
+			wantErr:            true,
+		},
+		{
+			name:               "zero cacheTTL",
+			readCheckpointSize: dummyReader,
+			storage:            dummyStorage,
+			maxCertLifetime:    24 * time.Hour,
+			pubInterval:        1 * time.Hour,
+			cacheTTL:           0,
+			wantErr:            true,
+		},
+		{
+			name:               "negative cacheTTL",
+			readCheckpointSize: dummyReader,
+			storage:            dummyStorage,
+			maxCertLifetime:    24 * time.Hour,
+			pubInterval:        1 * time.Hour,
+			cacheTTL:           -5 * time.Second,
 			wantErr:            true,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			pub, err := NewPublisher(ctx, tc.readCheckpointSize, tc.storage, tc.maxCertLifetime, tc.pubInterval)
+			pub, err := NewPublisher(ctx, tc.readCheckpointSize, tc.storage, tc.maxCertLifetime, tc.pubInterval, tc.cacheTTL)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("NewPublisher() error = %v, wantErr %v", err, tc.wantErr)
 			}
@@ -568,5 +600,182 @@ func TestNewPublisher(t *testing.T) {
 	}
 }
 
+func TestPublisher_CheckpointCaching(t *testing.T) {
+	ctx := context.Background()
+	memStorage := &mockStorage{}
+	readCount := 0
+	treeSize := uint64(100)
+	readCheckpointSize := func(ctx context.Context) (uint64, error) {
+		readCount++
+		return treeSize, nil
+	}
 
+	loopCtx, cancelLoop := context.WithCancel(ctx)
+	pub, err := NewPublisher(loopCtx, readCheckpointSize, memStorage, 24*time.Hour, 1*time.Hour, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("NewPublisher() error: %v", err)
+	}
+	cancelLoop()
+
+	// Update calls readCheckpointSize directly (fresh)
+	readCount = 0
+	if _, err := pub.Update(ctx); err != nil {
+		t.Fatalf("Update() error: %v", err)
+	}
+	if readCount != 1 {
+		t.Errorf("Update() readCount = %d, want 1", readCount)
+	}
+
+	// Tree grows to 150, making index 120 in-flight (pending next landmark)
+	treeSize = 150
+
+	// GetSubtreeFor on in-flight index uses cached size
+	readCount = 0
+	if _, _, retry, err := pub.GetSubtreeFor(ctx, 120); err != nil || retry == 0 {
+		t.Fatalf("GetSubtreeFor(120) = (_, _, %v, %v), want retry > 0 and no error", retry, err)
+	}
+	if readCount != 1 {
+		t.Errorf("First GetSubtreeFor() readCount = %d, want 1", readCount)
+	}
+
+	// Subsequent GetSubtreeFor within cacheTTL uses cached value (readCount unchanged)
+	if _, _, retry, err := pub.GetSubtreeFor(ctx, 120); err != nil || retry == 0 {
+		t.Fatalf("Second GetSubtreeFor(120) = (_, _, %v, %v), want retry > 0 and no error", retry, err)
+	}
+	if readCount != 1 {
+		t.Errorf("Second GetSubtreeFor() within cacheTTL readCount = %d, want 1", readCount)
+	}
+
+	// After cacheTTL expires, GetSubtreeFor re-fetches
+	time.Sleep(60 * time.Millisecond)
+	if _, _, retry, err := pub.GetSubtreeFor(ctx, 120); err != nil || retry == 0 {
+		t.Fatalf("Third GetSubtreeFor(120) = (_, _, %v, %v), want retry > 0 and no error", retry, err)
+	}
+	if readCount != 2 {
+		t.Errorf("Third GetSubtreeFor() after cacheTTL expiry readCount = %d, want 2", readCount)
+	}
+}
+
+func TestActiveLandmarks_GetSubtreeFor(t *testing.T) {
+	tests := []struct {
+		name      string
+		landmarks *ActiveLandmarks
+		index     uint64
+		wantStart uint64
+		wantEnd   uint64
+		wantErr   bool
+	}{
+		{
+			name:      "uninitialized landmarks",
+			landmarks: &ActiveLandmarks{},
+			index:     10,
+			wantErr:   true,
+		},
+		{
+			name:      "index too old (pruned)",
+			landmarks: mustNew(t, 3, 2, []uint64{150, 100, 50}),
+			index:     25,
+			wantErr:   true,
+		},
+		{
+			name:      "index not covered (exceeds latest landmark)",
+			landmarks: mustNew(t, 3, 3, []uint64{150, 100, 50, 0}),
+			index:     160,
+			wantErr:   true,
+		},
+		{
+			name:      "index 25 in landmark [0, 50)",
+			landmarks: mustNew(t, 3, 3, []uint64{150, 100, 50, 0}),
+			index:     25,
+			wantStart: 0,
+			wantEnd:   32,
+		},
+		{
+			name:      "index 40 in landmark [0, 50)",
+			landmarks: mustNew(t, 3, 3, []uint64{150, 100, 50, 0}),
+			index:     40,
+			wantStart: 32,
+			wantEnd:   50,
+		},
+		{
+			name:      "index 75 in landmark [50, 100)",
+			landmarks: mustNew(t, 3, 3, []uint64{150, 100, 50, 0}),
+			index:     75,
+			wantStart: 64,
+			wantEnd:   100,
+		},
+		{
+			name:      "index 130 in landmark [100, 150)",
+			landmarks: mustNew(t, 3, 3, []uint64{150, 100, 50, 0}),
+			index:     130,
+			wantStart: 128,
+			wantEnd:   150,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, e, err := tc.landmarks.GetSubtreeFor(tc.index)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("GetSubtreeFor(%d) error = %v, wantErr %v", tc.index, err, tc.wantErr)
+			}
+			if !tc.wantErr {
+				if s != tc.wantStart || e != tc.wantEnd {
+					t.Errorf("GetSubtreeFor(%d) = [%d, %d), want [%d, %d)", tc.index, s, e, tc.wantStart, tc.wantEnd)
+				}
+				if tc.index < s || tc.index >= e {
+					t.Errorf("GetSubtreeFor(%d) returned range [%d, %d) that does not contain index", tc.index, s, e)
+				}
+			}
+		})
+	}
+}
+
+func TestPublisher_GetSubtreeFor(t *testing.T) {
+	ctx := context.Background()
+	loopCtx, cancelLoop := context.WithCancel(ctx)
+	memStorage := &mockStorage{}
+	treeSize := uint64(150)
+	pub, err := NewPublisher(loopCtx, func(ctx context.Context) (uint64, error) { return treeSize, nil }, memStorage, 24*time.Hour, 1*time.Hour, 5*time.Second)
+	if err != nil {
+		t.Fatalf("NewPublisher() error: %v", err)
+	}
+	cancelLoop()
+
+	// Uninitialized publisher state returns pubInterval as retryAfter
+	pub.published.Store(nil)
+	if _, _, retry, err := pub.GetSubtreeFor(ctx, 10); err != nil || retry != pub.pubInterval {
+		t.Errorf("GetSubtreeFor with nil published = (_, _, %v, %v), want retry=%v, err=nil", retry, err, pub.pubInterval)
+	}
+
+	lm := mustNew(t, 2, 2, []uint64{100, 50, 0})
+	pub.published.Store(&published{active: lm, pubAt: time.Now()})
+
+	// Index 75 is covered by active landmark [50, 100) -> returns [64, 100)
+	s, e, retry, err := pub.GetSubtreeFor(ctx, 75)
+	if err != nil || retry != 0 || s != 64 || e != 100 {
+		t.Errorf("GetSubtreeFor(75) = ([%d, %d), %v, %v), want ([64, 100), 0, nil)", s, e, retry, err)
+	}
+
+	// Index 120 is not yet in active landmarks (latest 100), but is in log tree (150) -> retryAfter > 0
+	s, e, retry, err = pub.GetSubtreeFor(ctx, 120)
+	if err != nil || retry <= 0 {
+		t.Errorf("GetSubtreeFor(120) = ([%d, %d), %v, %v), want retry > 0 and err=nil", s, e, retry, err)
+	}
+
+	// Index 160 is beyond log tree (150) -> error
+	s, e, retry, err = pub.GetSubtreeFor(ctx, 160)
+	if err == nil {
+		t.Errorf("GetSubtreeFor(160) = ([%d, %d), %v, %v), want error", s, e, retry, err)
+	}
+
+	// Pruned active landmarks: index 25 is older than oldest active (50) -> ErrTooOld
+	prunedLM := mustNew(t, 3, 2, []uint64{150, 100, 50})
+	pub.published.Store(&published{active: prunedLM, pubAt: time.Now()})
+
+	_, _, _, err = pub.GetSubtreeFor(ctx, 25)
+	if !errors.Is(err, ErrTooOld) {
+		t.Errorf("GetSubtreeFor(25) error = %v, want %v", err, ErrTooOld)
+	}
+}
 

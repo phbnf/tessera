@@ -18,8 +18,10 @@ import (
 	"bytes"
 	"context"
 	stdasn1 "encoding/asn1"
+	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -681,4 +683,101 @@ func TestNewMTCLog(t *testing.T) {
 			t.Fatal("NewMTCLog returned nil instance")
 		}
 	})
+
+	t.Run("custom checkpoint cache TTL", func(t *testing.T) {
+		customOpts := newDummyOptions().WithLandmarkCheckpointCacheTTL(10 * time.Second)
+		logInst, err := NewMTCLog(ctx, &tessera.Appender{}, customOpts)
+		if err != nil {
+			t.Fatalf("NewMTCLog with custom cache TTL unexpected error: %v", err)
+		}
+		if logInst == nil {
+			t.Fatal("NewMTCLog returned nil instance")
+		}
+	})
+
+	t.Run("invalid checkpoint cache TTL", func(t *testing.T) {
+		invalidOpts := newDummyOptions().WithLandmarkCheckpointCacheTTL(0)
+		if _, err := NewMTCLog(ctx, &tessera.Appender{}, invalidOpts); err == nil {
+			t.Error("NewMTCLog with cache TTL 0 expected error, got nil")
+		}
+	})
+}
+
+func (p *MTCProof) unmarshal(data []byte) error {
+	s := cryptobyte.String(data)
+
+	var extensions cryptobyte.String
+	if !s.ReadUint16LengthPrefixed(&extensions) {
+		return errors.New("malformed extensions")
+	}
+	p.Extensions = append([]byte(nil), extensions...)
+
+	var startHigh uint16
+	var startLow uint32
+	if !s.ReadUint16(&startHigh) || !s.ReadUint32(&startLow) {
+		return errors.New("malformed start index")
+	}
+	p.Start = (uint64(startHigh) << 32) | uint64(startLow)
+
+	var endHigh uint16
+	var endLow uint32
+	if !s.ReadUint16(&endHigh) || !s.ReadUint32(&endLow) {
+		return errors.New("malformed end index")
+	}
+	p.End = (uint64(endHigh) << 32) | uint64(endLow)
+
+	var incProof cryptobyte.String
+	if !s.ReadUint16LengthPrefixed(&incProof) {
+		return errors.New("malformed inclusion_proof")
+	}
+	p.InclusionProof = nil
+	for !incProof.Empty() {
+		var hash []byte
+		if !incProof.ReadBytes(&hash, 32) {
+			return errors.New("malformed hash in inclusion_proof")
+		}
+		p.InclusionProof = append(p.InclusionProof, hash)
+	}
+
+	var sigs cryptobyte.String
+	if !s.ReadUint16LengthPrefixed(&sigs) {
+		return errors.New("malformed signatures")
+	}
+	p.Signatures = nil
+	for !sigs.Empty() {
+		var sig cryptobyte.String
+		if !sigs.ReadUint16LengthPrefixed(&sig) {
+			return errors.New("malformed signature in signatures")
+		}
+		p.Signatures = append(p.Signatures, append([]byte(nil), sig...))
+	}
+
+	if !s.Empty() {
+		return errors.New("trailing bytes after MTCProof")
+	}
+	return nil
+}
+
+func TestMTCProof_Marshal(t *testing.T) {
+	orig := MTCProof{
+		Extensions:     []byte{1, 2, 3},
+		Start:          3631,
+		End:            3981,
+		InclusionProof: [][]byte{bytes.Repeat([]byte{0xaa}, 32), bytes.Repeat([]byte{0xbb}, 32)},
+		Signatures:     [][]byte{[]byte("sig1"), []byte("sig2")},
+	}
+
+	data, err := orig.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	var parsed MTCProof
+	if err := parsed.unmarshal(data); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	if !reflect.DeepEqual(orig, parsed) {
+		t.Errorf("unmarshal = %+v, want %+v", parsed, orig)
+	}
 }
