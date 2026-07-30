@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -222,15 +223,15 @@ func TestNew_Routes(t *testing.T) {
 			wantStatus: http.StatusMethodNotAllowed,
 		},
 		{
-			name:       "GET /proof-to-landmark valid method",
-			method:     http.MethodGet,
+			name:       "POST /proof-to-landmark valid method",
+			method:     http.MethodPost,
 			path:       "/proof-to-landmark",
-			body:       func() io.Reader { return nil },
-			wantStatus: http.StatusNotImplemented,
+			body:       func() io.Reader { return strings.NewReader(`{"index":0}`) },
+			wantStatus: http.StatusBadRequest,
 		},
 		{
-			name:       "POST /proof-to-landmark invalid method",
-			method:     http.MethodPost,
+			name:       "GET /proof-to-landmark invalid method",
+			method:     http.MethodGet,
 			path:       "/proof-to-landmark",
 			body:       func() io.Reader { return nil },
 			wantStatus: http.StatusMethodNotAllowed,
@@ -253,6 +254,88 @@ func TestNew_Routes(t *testing.T) {
 
 			if w.Code != tc.wantStatus {
 				t.Errorf("%s %s: want status %d, got %d: %s", tc.method, tc.path, tc.wantStatus, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestProofToLandmarkHandler(t *testing.T) {
+	tests := []struct {
+		name           string
+		method         string
+		path           string
+		body           string
+		proofFn        proofToLandmark
+		wantStatus     int
+		wantBody       string
+		wantRetryAfter string
+	}{
+		{
+			name:   "success json body",
+			method: http.MethodPost,
+			path:   "/proof-to-landmark",
+			body:   `{"index":10}`,
+			proofFn: func(_ context.Context, req log.ProofToLandmarkReq) (log.ProofToLandmarkRsp, error) {
+				if req.Index != 10 {
+					return log.ProofToLandmarkRsp{}, fmt.Errorf("unexpected index %d", req.Index)
+				}
+				return log.ProofToLandmarkRsp{}, nil
+			},
+			wantStatus: http.StatusOK,
+			wantBody:   `"tooOld":false,"retryAfter":0}`,
+		},
+		{
+			name:   "too old entry",
+			method: http.MethodPost,
+			path:   "/proof-to-landmark",
+			body:   `{"index":5}`,
+			proofFn: func(_ context.Context, req log.ProofToLandmarkReq) (log.ProofToLandmarkRsp, error) {
+				return log.ProofToLandmarkRsp{TooOld: true}, nil
+			},
+			wantStatus: http.StatusGone,
+			wantBody:   `"tooOld":true`,
+		},
+		{
+			name:   "retry after future entry",
+			method: http.MethodPost,
+			path:   "/proof-to-landmark",
+			body:   `{"index":100}`,
+			proofFn: func(_ context.Context, req log.ProofToLandmarkReq) (log.ProofToLandmarkRsp, error) {
+				return log.ProofToLandmarkRsp{RetryAfter: 45 * time.Second}, nil
+			},
+			wantStatus:     http.StatusOK,
+			wantBody:       `"retryAfter":45000000000`,
+			wantRetryAfter: "45",
+		},
+		{
+			name:   "error exceeding tree size",
+			method: http.MethodPost,
+			path:   "/proof-to-landmark",
+			body:   `{"index":10000}`,
+			proofFn: func(_ context.Context, req log.ProofToLandmarkReq) (log.ProofToLandmarkRsp, error) {
+				return log.ProofToLandmarkRsp{}, fmt.Errorf("index 10000 exceeds current log tree size 4378")
+			},
+			wantStatus: http.StatusBadRequest,
+			wantBody:   `exceeds current log tree size 4378`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := proofToLandmarkHandler(tc.proofFn)
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			w := httptest.NewRecorder()
+
+			h.ServeHTTP(w, req)
+
+			if w.Code != tc.wantStatus {
+				t.Errorf("want status %d, got %d: %s", tc.wantStatus, w.Code, w.Body.String())
+			}
+			if tc.wantBody != "" && !strings.Contains(w.Body.String(), tc.wantBody) {
+				t.Errorf("want body containing %q, got %q", tc.wantBody, w.Body.String())
+			}
+			if tc.wantRetryAfter != "" && w.Header().Get("Retry-After") != tc.wantRetryAfter {
+				t.Errorf("want Retry-After header %q, got %q", tc.wantRetryAfter, w.Header().Get("Retry-After"))
 			}
 		})
 	}

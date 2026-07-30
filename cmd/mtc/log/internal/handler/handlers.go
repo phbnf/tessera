@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/transparency-dev/tessera/cmd/mtc/log"
 )
@@ -29,22 +31,20 @@ const (
 	// (128 KiB) for JSON submissions. This accommodates base64 encoding and JSON
 	// formatting overhead for certificates up to 64 KiB binary size.
 	maxAddTBSRequestBodyBytes = 128 << 10
+
+	// maxProofToLandmarkRequestBodyBytes is limited to 1 KiB since ProofToLandmarkReq
+	// only contains a JSON object with a uint64 index.
+	maxProofToLandmarkRequestBodyBytes = 1024
 )
 
 type addTBS func(context.Context, log.TBSCertificateLogEntry) (*log.AddTBSRsp, error)
+type proofToLandmark func(context.Context, log.ProofToLandmarkReq) (log.ProofToLandmarkRsp, error)
 
 // New returns a new http.Handler for the mtc-tlog service.
 func New(mtcLog *log.MTCLog) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("POST /add-tbs", http.MaxBytesHandler(addTBSHandler(mtcLog.AddTBS), maxAddTBSRequestBodyBytes))
-	mux.HandleFunc("GET /proof-to-landmark", func(w http.ResponseWriter, r *http.Request) {
-		// TODO parse request
-		// TODO write response
-		if _, err := mtcLog.ProofToLandmark(r.Context(), 0); err != nil {
-			slog.ErrorContext(r.Context(), "Failed to fetch inclusion proof to landmark", slog.Any("error", err))
-		}
-		http.Error(w, "not implemented", http.StatusNotImplemented)
-	})
+	mux.Handle("POST /proof-to-landmark", http.MaxBytesHandler(proofToLandmarkHandler(mtcLog.ProofToLandmark), maxProofToLandmarkRequestBodyBytes))
 	return mux
 }
 
@@ -85,6 +85,48 @@ func addTBSHandler(add addTBS) http.Handler {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
+		if err := json.NewEncoder(w).Encode(rsp); err != nil {
+			slog.ErrorContext(r.Context(), "failed to write response", slog.Any("error", err))
+		}
+	})
+}
+
+func proofToLandmarkHandler(proofFn proofToLandmark) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := r.Body.Close(); err != nil {
+				slog.ErrorContext(r.Context(), "resp.Body.Close()", slog.Any("error", err))
+			}
+		}()
+
+		var req log.ProofToLandmarkReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			slog.WarnContext(r.Context(), "rejection: malformed JSON submission", slog.Any("error", err))
+			http.Error(w, "Invalid ProofToLandmarkReq JSON payload", http.StatusBadRequest)
+			return
+		}
+
+		rsp, err := proofFn(r.Context(), req)
+		if err != nil {
+			slog.ErrorContext(r.Context(), "failed to fetch inclusion proof to landmark", slog.Any("error", err))
+			http.Error(w, fmt.Sprintf("Could not fetch inclusion proof to landmark: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		if rsp.TooOld {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGone)
+			_ = json.NewEncoder(w).Encode(rsp)
+			return
+		}
+
+		if rsp.RetryAfter > 0 {
+			retrySeconds := max(1, int((rsp.RetryAfter+time.Second-1)/time.Second))
+			w.Header().Set("Retry-After", strconv.Itoa(retrySeconds))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
 		if err := json.NewEncoder(w).Encode(rsp); err != nil {
 			slog.ErrorContext(r.Context(), "failed to write response", slog.Any("error", err))
 		}

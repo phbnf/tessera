@@ -23,7 +23,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/transparency-dev/merkle/proof"
 )
 
 const (
@@ -45,6 +48,14 @@ const (
 	// days, MTC CA landmarks SHOULD be generated approximately every four 4 hours,
 	// and MUST NOT exceed a total of 370 landmarks over any 47-day period."
 	MaxActiveLandmarks = 370
+)
+
+var (
+	// ErrTooOld indicates that an index precedes the earliest available active landmark.
+	ErrTooOld = errors.New("entry is older than earliest active landmark")
+
+	// ErrNotCovered indicates that an index is not yet covered by any published active landmark.
+	ErrNotCovered = errors.New("entry is not covered by active landmarks")
 )
 
 // ReadCheckpointSize returns the current log checkpoint size.
@@ -219,16 +230,30 @@ func (a *ActiveLandmarks) AddLandmark(treeSize, maxActive uint64) error {
 	return nil
 }
 
+type published struct {
+	active *ActiveLandmarks
+	pubAt  time.Time
+}
+
+type cachedCheckpoint struct {
+	size      uint64
+	fetchedAt time.Time
+}
+
 // Publisher manages publication of the landmarks resource at regular intervals.
 type Publisher struct {
 	storage            LandmarksStorage
 	readCheckpointSize ReadCheckpointSize
 	maxActive          uint64
 	pubInterval        time.Duration
+	cacheTTL           time.Duration
+
+	published atomic.Pointer[published]
+	cachedCP  atomic.Pointer[cachedCheckpoint]
 }
 
 // NewPublisher creates a new Publisher instance.
-func NewPublisher(ctx context.Context, readCheckpointSize ReadCheckpointSize, storage LandmarksStorage, maxCertLifetime, pubInterval time.Duration) (*Publisher, error) {
+func NewPublisher(ctx context.Context, readCheckpointSize ReadCheckpointSize, storage LandmarksStorage, maxCertLifetime, pubInterval, cacheTTL time.Duration) (*Publisher, error) {
 	if storage == nil {
 		return nil, errors.New("storage must not be nil")
 	}
@@ -243,6 +268,9 @@ func NewPublisher(ctx context.Context, readCheckpointSize ReadCheckpointSize, st
 	}
 	if pubInterval > maxCertLifetime {
 		return nil, fmt.Errorf("pubInterval (%v) must not exceed maxCertLifetime (%v)", pubInterval, maxCertLifetime)
+	}
+	if cacheTTL <= 0 {
+		return nil, errors.New("cacheTTL must be strictly positive")
 	}
 
 	// SPEC: draft-ietf-plants-merkle-tree-certs section 6.4.3.
@@ -262,6 +290,7 @@ func NewPublisher(ctx context.Context, readCheckpointSize ReadCheckpointSize, st
 		readCheckpointSize: readCheckpointSize,
 		maxActive:          maxActive,
 		pubInterval:        pubInterval,
+		cacheTTL:           cacheTTL,
 	}
 
 	if err := p.initialise(ctx); err != nil {
@@ -273,13 +302,30 @@ func NewPublisher(ctx context.Context, readCheckpointSize ReadCheckpointSize, st
 	return p, nil
 }
 
+func (p *Publisher) cachedCheckpointSize(ctx context.Context) (uint64, error) {
+	if cached := p.cachedCP.Load(); cached != nil && time.Since(cached.fetchedAt) < p.cacheTTL {
+		return cached.size, nil
+	}
+
+	size, err := p.readCheckpointSize(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	p.cachedCP.Store(&cachedCheckpoint{
+		size:      size,
+		fetchedAt: time.Now(),
+	})
+	return size, nil
+}
+
 // initialise loads the existing active landmarks resource from storage, or initialises it with landmark zero.
 func (p *Publisher) initialise(ctx context.Context) error {
 	activeLM, err := newActiveLandmarks(0, 0, []uint64{0})
 	if err != nil {
 		return fmt.Errorf("failed to create initial landmark 0: %w", err)
 	}
-	_, err = p.storage.UpdateLandmarks(ctx, func(old []byte, _ time.Time) ([]byte, error) {
+	modTime, err := p.storage.UpdateLandmarks(ctx, func(old []byte, _ time.Time) ([]byte, error) {
 		if len(old) == 0 {
 			return activeLM.MarshalText()
 		}
@@ -293,6 +339,10 @@ func (p *Publisher) initialise(ctx context.Context) error {
 		return fmt.Errorf("failed to initialise active landmarks: %w", err)
 	}
 
+	p.published.Store(&published{
+		active: activeLM,
+		pubAt:  modTime,
+	})
 	return nil
 }
 
@@ -366,6 +416,11 @@ func (p *Publisher) Update(ctx context.Context) (time.Duration, error) {
 		return 0, fmt.Errorf("failed to update landmarks resource: %v", err)
 	}
 
+	p.published.Store(&published{
+		active: active,
+		pubAt:  modTime,
+	})
+
 	next := p.pubInterval
 	if grown {
 		next = max(time.Millisecond, time.Until(modTime.Add(p.pubInterval)))
@@ -373,4 +428,75 @@ func (p *Publisher) Update(ctx context.Context) (time.Duration, error) {
 
 	slog.DebugContext(ctx, "landmarks update: success", slog.Duration("next-in", next))
 	return next, nil
+}
+
+// GetSubtreeFor returns the subtree range [start, end) of active landmarks covering index.
+// It returns ErrTooOld if index precedes the earliest available active landmark.
+// It returns ErrNotCovered if index is not yet covered by any published active landmark.
+func (a *ActiveLandmarks) GetSubtreeFor(index uint64) (start, end uint64, err error) {
+	switch {
+	case len(a.treeSizes) == 0:
+		return 0, 0, errors.New("no landmarks available")
+	case index >= a.treeSizes[0]:
+		return 0, 0, ErrNotCovered
+	case index < a.treeSizes[len(a.treeSizes)-1]:
+		return 0, 0, ErrTooOld
+	}
+
+	var startLM, endLM uint64
+	for i := len(a.treeSizes) - 1; i >= 0; i-- {
+		if index < a.treeSizes[i] {
+			endLM = a.treeSizes[i]
+			startLM = a.treeSizes[i+1]
+			break
+		}
+	}
+
+	s, mid, e, err := proof.FindSubtrees(startLM, endLM)
+	if err != nil {
+		return 0, 0, fmt.Errorf("FindSubtrees(%d, %d): %w", startLM, endLM, err)
+	}
+
+	if index < mid {
+		return s, mid, nil
+	}
+	return mid, e, nil
+}
+
+// GetSubtreeFor returns the subtree range [start, end) of active landmarks covering index.
+//
+//   - If index is not yet in published landmarks but is within the current log
+//     tree size, returns retryAfter > 0 indicating estimated time until the
+//     next landmark publication. This is a best effort estimate.
+//   - If index precedes the earliest available active landmark, returns ErrTooOld.
+//   - If index exceeds the current log tree size, it returns an error.
+func (p *Publisher) GetSubtreeFor(ctx context.Context, index uint64) (start, end uint64, retryAfter time.Duration, err error) {
+	pub := p.published.Load()
+	if pub == nil || pub.active == nil {
+		return 0, 0, p.pubInterval, nil
+	}
+
+	start, end, err = pub.active.GetSubtreeFor(index)
+	switch {
+	case err == nil:
+		return start, end, 0, nil
+
+	case errors.Is(err, ErrTooOld):
+		return 0, 0, 0, ErrTooOld
+
+	case errors.Is(err, ErrNotCovered):
+		cpSize, err := p.cachedCheckpointSize(ctx)
+		if err != nil {
+			return 0, 0, 0, fmt.Errorf("read checkpoint size: %w", err)
+		}
+		if index < cpSize {
+			// TODO: scatter retryAfter to avoid a surge for requests.
+			retry := max(time.Millisecond, time.Until(pub.pubAt.Add(p.pubInterval)))
+			return 0, 0, retry, nil
+		}
+		return 0, 0, 0, fmt.Errorf("index %d exceeds current log tree size %d", index, cpSize)
+
+	default:
+		return 0, 0, 0, err
+	}
 }
