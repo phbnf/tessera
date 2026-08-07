@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"github.com/transparency-dev/tessera/cmd/mtc/log/internal/landmark"
+	tesseraotel "github.com/transparency-dev/tessera/internal/otel"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -50,65 +52,70 @@ func NewStorage(storageDir string) *Storage {
 
 // ReadLandmarks returns the raw contents of the active landmarks file and its last modification time.
 func (s *Storage) ReadLandmarks(ctx context.Context) ([]byte, time.Time, error) {
-	f, err := os.Open(s.path)
-	if err != nil {
-		return nil, time.Time{}, err
-	}
-	defer func() {
-		_ = f.Close()
-	}()
+	return tesseraotel.Trace2(ctx, "tessera.mtc.landmark.posix.ReadLandmarks", tracer, func(ctx context.Context, span trace.Span) ([]byte, time.Time, error) {
+		f, err := os.Open(s.path)
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+		defer func() {
+			_ = f.Close()
+		}()
 
-	info, err := f.Stat()
-	if err != nil {
-		return nil, time.Time{}, err
-	}
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return nil, time.Time{}, err
-	}
-	return data, info.ModTime(), nil
+		info, err := f.Stat()
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+		return data, info.ModTime(), nil
+	})
 }
 
-// UpdateLandmarks executes fn and writes any updated landmarks data.
+// UpdateLandmarks executes fn and writes any updated landmark data.
 // Runs under an advisory file lock to ensure distinct tasks are serialized.
 func (s *Storage) UpdateLandmarks(ctx context.Context, fn func(old []byte, oldModTime time.Time) ([]byte, error)) (time.Time, error) {
-	unlock, err := lockFile(ctx, s.lockPath)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("lockFile(%s): %w", s.lockPath, err)
-	}
-	defer func() {
-		if err := unlock(); err != nil {
-			slog.WarnContext(ctx, "unlock failed", slog.String("lockpath", s.lockPath), slog.Any("error", err))
+	return tesseraotel.Trace(ctx, "tessera.mtc.landmark.posix.UpdateLandmarks", tracer, func(ctx context.Context, span trace.Span) (time.Time, error) {
+		unlock, err := lockFile(ctx, s.lockPath)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("lockFile(%s): %w", s.lockPath, err)
 		}
-	}()
+		defer func() {
+			if err := unlock(); err != nil {
+				slog.WarnContext(ctx, "unlock failed", slog.String("lockpath", s.lockPath), slog.Any("error", err))
+			}
+		}()
 
-	oldData, oldModTime, err := s.ReadLandmarks(ctx)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return time.Time{}, fmt.Errorf("read landmarks for update: %w", err)
-	}
+		oldData, oldModTime, err := s.ReadLandmarks(ctx)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return time.Time{}, fmt.Errorf("read landmarks for update: %w", err)
+		}
 
-	newData, err := fn(oldData, oldModTime)
-	if err != nil {
-		return time.Time{}, err
-	}
+		newData, err := fn(oldData, oldModTime)
+		if err != nil {
+			return time.Time{}, err
+		}
 
-	if bytes.Equal(oldData, newData) && len(oldData) > 0 {
-		slog.DebugContext(ctx, "skipping landmarks write because contents are unchanged", slog.String("path", s.path))
-		return oldModTime, nil
-	}
+		if bytes.Equal(oldData, newData) && len(oldData) > 0 {
+			slog.DebugContext(ctx, "skipping landmarks write because contents are unchanged", slog.String("path", s.path))
+			return oldModTime, nil
+		}
 
-	if err := overwrite(s.path, newData); err != nil {
-		return time.Time{}, err
-	}
-	slog.DebugContext(ctx, "wrote landmarks file", slog.String("path", s.path))
-	info, err := os.Stat(s.path)
-	// In case the write succeeded but we then fail to read mod time, use the
-	// current time as a proxy.
-	if err != nil {
-		return time.Now(), nil
-	}
-	return info.ModTime(), nil
+		if err := overwrite(s.path, newData); err != nil {
+			return time.Time{}, err
+		}
+		slog.DebugContext(ctx, "wrote landmarks file", slog.String("path", s.path))
+		info, err := os.Stat(s.path)
+		// In case the write succeeded but we then fail to read mod time, use the
+		// current time as a proxy.
+		if err != nil {
+			return time.Now(), nil
+		}
+		return info.ModTime(), nil
+	})
 }
+
 
 // lockFile creates/opens a lock file at the specified path, and flocks it.
 // Once locked, the caller performs necessary operations before calling the
@@ -118,24 +125,30 @@ func (s *Storage) UpdateLandmarks(ctx context.Context, fn func(old []byte, oldMo
 // (e.g. <something>.lock>) to avoid inherent brittleness of the `fcntrl` API
 // (*any* `Close` operation on this file (even if it's a different FD) from
 // this PID, or overwriting of the file by *any* process breaks the lock.)
-func lockFile(_ context.Context, p string) (func() error, error) {
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, filePerm)
-	if err != nil {
-		return nil, err
-	}
-
-	for {
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != syscall.EINTR {
-			if err != nil {
-				errClose := f.Close()
-				return nil, errors.Join(err, errClose)
-			}
-			c := func() error {
-				errFlock := syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-				errClose := f.Close()
-				return errors.Join(errFlock, errClose)
-			}
-			return c, nil
+func lockFile(ctx context.Context, p string) (func() error, error) {
+	return tesseraotel.Trace(ctx, "tessera.mtc.landmark.posix.lockFile", tracer, func(ctx context.Context, span trace.Span) (func() error, error) {
+		span.AddEvent("Open file")
+		f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, filePerm)
+		if err != nil {
+			return nil, err
 		}
-	}
+
+		span.AddEvent("Lock attempt")
+		for {
+			if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != syscall.EINTR {
+				if err != nil {
+					errClose := f.Close()
+					return nil, errors.Join(err, errClose)
+				}
+				span.AddEvent("Lock taken")
+				c := func() error {
+					span.AddEvent("Lock released")
+					errFlock := syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+					errClose := f.Close()
+					return errors.Join(errFlock, errClose)
+				}
+				return c, nil
+			}
+		}
+	})
 }
