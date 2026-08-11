@@ -235,25 +235,18 @@ type published struct {
 	pubAt  time.Time
 }
 
-type cachedCheckpoint struct {
-	size      uint64
-	fetchedAt time.Time
-}
-
 // Publisher manages publication of the landmarks resource at regular intervals.
 type Publisher struct {
 	storage            LandmarksStorage
 	readCheckpointSize ReadCheckpointSize
 	maxActive          uint64
 	pubInterval        time.Duration
-	cacheTTL           time.Duration
 
 	published atomic.Pointer[published]
-	cachedCP  atomic.Pointer[cachedCheckpoint]
 }
 
 // NewPublisher creates a new Publisher instance.
-func NewPublisher(ctx context.Context, readCheckpointSize ReadCheckpointSize, storage LandmarksStorage, maxCertLifetime, pubInterval, cacheTTL time.Duration) (*Publisher, error) {
+func NewPublisher(ctx context.Context, readCheckpointSize ReadCheckpointSize, storage LandmarksStorage, maxCertLifetime, pubInterval time.Duration) (*Publisher, error) {
 	if storage == nil {
 		return nil, errors.New("storage must not be nil")
 	}
@@ -268,9 +261,6 @@ func NewPublisher(ctx context.Context, readCheckpointSize ReadCheckpointSize, st
 	}
 	if pubInterval > maxCertLifetime {
 		return nil, fmt.Errorf("pubInterval (%v) must not exceed maxCertLifetime (%v)", pubInterval, maxCertLifetime)
-	}
-	if cacheTTL <= 0 {
-		return nil, errors.New("cacheTTL must be strictly positive")
 	}
 
 	// SPEC: draft-ietf-plants-merkle-tree-certs section 6.4.3.
@@ -290,7 +280,6 @@ func NewPublisher(ctx context.Context, readCheckpointSize ReadCheckpointSize, st
 		readCheckpointSize: readCheckpointSize,
 		maxActive:          maxActive,
 		pubInterval:        pubInterval,
-		cacheTTL:           cacheTTL,
 	}
 
 	if err := p.initialise(ctx); err != nil {
@@ -300,23 +289,6 @@ func NewPublisher(ctx context.Context, readCheckpointSize ReadCheckpointSize, st
 	go p.start(ctx)
 
 	return p, nil
-}
-
-func (p *Publisher) cachedCheckpointSize(ctx context.Context) (uint64, error) {
-	if cached := p.cachedCP.Load(); cached != nil && time.Since(cached.fetchedAt) < p.cacheTTL {
-		return cached.size, nil
-	}
-
-	size, err := p.readCheckpointSize(ctx)
-	if err != nil {
-		return 0, err
-	}
-
-	p.cachedCP.Store(&cachedCheckpoint{
-		size:      size,
-		fetchedAt: time.Now(),
-	})
-	return size, nil
 }
 
 // initialise loads the existing active landmarks resource from storage, or initialises it with landmark zero.
@@ -485,7 +457,7 @@ func (p *Publisher) GetSubtreeFor(ctx context.Context, index uint64) (start, end
 		return 0, 0, 0, ErrTooOld
 
 	case errors.Is(err, ErrNotCovered):
-		cpSize, err := p.cachedCheckpointSize(ctx)
+		cpSize, err := p.readCheckpointSize(ctx)
 		if err != nil {
 			return 0, 0, 0, fmt.Errorf("read checkpoint size: %w", err)
 		}

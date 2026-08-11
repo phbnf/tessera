@@ -315,7 +315,7 @@ func TestPublisher_Initialise(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			loopCtx, cancelLoop := context.WithCancel(ctx)
 			memStorage := &mockStorage{data: tc.initialData}
-			_, err := NewPublisher(loopCtx, func(ctx context.Context) (uint64, error) { return 0, nil }, memStorage, 24*time.Hour, 1*time.Hour, 5*time.Second)
+			_, err := NewPublisher(loopCtx, func(ctx context.Context) (uint64, error) { return 0, nil }, memStorage, 24*time.Hour, 1*time.Hour)
 			if err != nil {
 				t.Fatalf("NewPublisher() error: %v", err)
 			}
@@ -346,7 +346,7 @@ func TestPublisher_Update(t *testing.T) {
 
 	memStorage := &mockStorage{}
 	// maxCertLifetime = 1h, pubInterval = 1h => maxActive = ceil(1/1) + 1 = 2
-	pub, err := NewPublisher(loopCtx, readCheckpointSize, memStorage, 1*time.Hour, 1*time.Hour, 5*time.Second)
+	pub, err := NewPublisher(loopCtx, readCheckpointSize, memStorage, 1*time.Hour, 1*time.Hour)
 	if err != nil {
 		t.Fatalf("NewPublisher() error: %v", err)
 	}
@@ -455,7 +455,6 @@ func TestNewPublisher(t *testing.T) {
 		storage            LandmarksStorage
 		maxCertLifetime    time.Duration
 		pubInterval        time.Duration
-		cacheTTL           time.Duration
 		wantErr            bool
 		wantMaxActive      uint64
 	}{
@@ -465,7 +464,6 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    24 * time.Hour,
 			pubInterval:        1 * time.Hour,
-			cacheTTL:           5 * time.Second,
 			wantMaxActive:      25, // ceil(24/1) + 1 = 25
 		},
 		{
@@ -474,7 +472,6 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    25 * time.Hour,
 			pubInterval:        2 * time.Hour,
-			cacheTTL:           5 * time.Second,
 			wantMaxActive:      14, // ceil(12.5) + 1 = 13 + 1 = 14
 		},
 		{
@@ -483,7 +480,6 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    1 * time.Hour,
 			pubInterval:        1 * time.Hour,
-			cacheTTL:           5 * time.Second,
 			wantMaxActive:      2, // ceil(1/1) + 1 = 2
 		},
 		{
@@ -492,7 +488,6 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    47 * 24 * time.Hour,
 			pubInterval:        4 * time.Hour,
-			cacheTTL:           5 * time.Second,
 			wantMaxActive:      283, // ceil(1128/4) + 1 = 283
 		},
 		{
@@ -501,7 +496,6 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    10 * time.Minute,
 			pubInterval:        15 * time.Minute,
-			cacheTTL:           5 * time.Second,
 			wantErr:            true,
 		},
 		{
@@ -510,7 +504,6 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    47 * 24 * time.Hour,
 			pubInterval:        1 * time.Hour,
-			cacheTTL:           5 * time.Second,
 			wantErr:            true,
 		},
 		{
@@ -519,7 +512,6 @@ func TestNewPublisher(t *testing.T) {
 			storage:            nil,
 			maxCertLifetime:    24 * time.Hour,
 			pubInterval:        1 * time.Hour,
-			cacheTTL:           5 * time.Second,
 			wantErr:            true,
 		},
 		{
@@ -528,7 +520,6 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    24 * time.Hour,
 			pubInterval:        1 * time.Hour,
-			cacheTTL:           5 * time.Second,
 			wantErr:            true,
 		},
 		{
@@ -537,7 +528,6 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    0,
 			pubInterval:        1 * time.Hour,
-			cacheTTL:           5 * time.Second,
 			wantErr:            true,
 		},
 		{
@@ -546,7 +536,6 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    -1 * time.Hour,
 			pubInterval:        1 * time.Hour,
-			cacheTTL:           5 * time.Second,
 			wantErr:            true,
 		},
 		{
@@ -555,7 +544,6 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    24 * time.Hour,
 			pubInterval:        0,
-			cacheTTL:           5 * time.Second,
 			wantErr:            true,
 		},
 		{
@@ -564,32 +552,13 @@ func TestNewPublisher(t *testing.T) {
 			storage:            dummyStorage,
 			maxCertLifetime:    24 * time.Hour,
 			pubInterval:        -1 * time.Hour,
-			cacheTTL:           5 * time.Second,
-			wantErr:            true,
-		},
-		{
-			name:               "zero cacheTTL",
-			readCheckpointSize: dummyReader,
-			storage:            dummyStorage,
-			maxCertLifetime:    24 * time.Hour,
-			pubInterval:        1 * time.Hour,
-			cacheTTL:           0,
-			wantErr:            true,
-		},
-		{
-			name:               "negative cacheTTL",
-			readCheckpointSize: dummyReader,
-			storage:            dummyStorage,
-			maxCertLifetime:    24 * time.Hour,
-			pubInterval:        1 * time.Hour,
-			cacheTTL:           -5 * time.Second,
 			wantErr:            true,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			pub, err := NewPublisher(ctx, tc.readCheckpointSize, tc.storage, tc.maxCertLifetime, tc.pubInterval, tc.cacheTTL)
+			pub, err := NewPublisher(ctx, tc.readCheckpointSize, tc.storage, tc.maxCertLifetime, tc.pubInterval)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("NewPublisher() error = %v, wantErr %v", err, tc.wantErr)
 			}
@@ -597,62 +566,6 @@ func TestNewPublisher(t *testing.T) {
 				t.Errorf("pub.maxActive = %d, want %d", pub.maxActive, tc.wantMaxActive)
 			}
 		})
-	}
-}
-
-func TestPublisher_CheckpointCaching(t *testing.T) {
-	ctx := context.Background()
-	memStorage := &mockStorage{}
-	readCount := 0
-	treeSize := uint64(100)
-	readCheckpointSize := func(ctx context.Context) (uint64, error) {
-		readCount++
-		return treeSize, nil
-	}
-
-	loopCtx, cancelLoop := context.WithCancel(ctx)
-	pub, err := NewPublisher(loopCtx, readCheckpointSize, memStorage, 24*time.Hour, 1*time.Hour, 50*time.Millisecond)
-	if err != nil {
-		t.Fatalf("NewPublisher() error: %v", err)
-	}
-	cancelLoop()
-
-	// Update calls readCheckpointSize directly (fresh)
-	readCount = 0
-	if _, err := pub.Update(ctx); err != nil {
-		t.Fatalf("Update() error: %v", err)
-	}
-	if readCount != 1 {
-		t.Errorf("Update() readCount = %d, want 1", readCount)
-	}
-
-	// Tree grows to 150, making index 120 in-flight (pending next landmark)
-	treeSize = 150
-
-	// GetSubtreeFor on in-flight index uses cached size
-	readCount = 0
-	if _, _, retry, err := pub.GetSubtreeFor(ctx, 120); err != nil || retry == 0 {
-		t.Fatalf("GetSubtreeFor(120) = (_, _, %v, %v), want retry > 0 and no error", retry, err)
-	}
-	if readCount != 1 {
-		t.Errorf("First GetSubtreeFor() readCount = %d, want 1", readCount)
-	}
-
-	// Subsequent GetSubtreeFor within cacheTTL uses cached value (readCount unchanged)
-	if _, _, retry, err := pub.GetSubtreeFor(ctx, 120); err != nil || retry == 0 {
-		t.Fatalf("Second GetSubtreeFor(120) = (_, _, %v, %v), want retry > 0 and no error", retry, err)
-	}
-	if readCount != 1 {
-		t.Errorf("Second GetSubtreeFor() within cacheTTL readCount = %d, want 1", readCount)
-	}
-
-	// After cacheTTL expires, GetSubtreeFor re-fetches
-	time.Sleep(60 * time.Millisecond)
-	if _, _, retry, err := pub.GetSubtreeFor(ctx, 120); err != nil || retry == 0 {
-		t.Fatalf("Third GetSubtreeFor(120) = (_, _, %v, %v), want retry > 0 and no error", retry, err)
-	}
-	if readCount != 2 {
-		t.Errorf("Third GetSubtreeFor() after cacheTTL expiry readCount = %d, want 2", readCount)
 	}
 }
 
@@ -736,7 +649,7 @@ func TestPublisher_GetSubtreeFor(t *testing.T) {
 	loopCtx, cancelLoop := context.WithCancel(ctx)
 	memStorage := &mockStorage{}
 	treeSize := uint64(150)
-	pub, err := NewPublisher(loopCtx, func(ctx context.Context) (uint64, error) { return treeSize, nil }, memStorage, 24*time.Hour, 1*time.Hour, 5*time.Second)
+	pub, err := NewPublisher(loopCtx, func(ctx context.Context) (uint64, error) { return treeSize, nil }, memStorage, 24*time.Hour, 1*time.Hour)
 	if err != nil {
 		t.Fatalf("NewPublisher() error: %v", err)
 	}
