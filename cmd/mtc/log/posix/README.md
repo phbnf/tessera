@@ -92,8 +92,10 @@ go run github.com/transparency-dev/witness/cmd/generate_keys@main \
 > per Chrome's draft CQRP policy.
 
 #### Mirror & Witness Cosigner Keys (Optional for Mirroring)
-If you are running an MTC mirror alongside the log, you will also need a
-separate cosigner key pairs for the mirror service:
+If you are running an MTC mirror alongside the log, you will also need
+cosigner keys for the mirror service.
+
+For the **Tessera POSIX mirror**:
 
 ```bash
 go run github.com/transparency-dev/witness/cmd/generate_keys@main \
@@ -101,6 +103,16 @@ go run github.com/transparency-dev/witness/cmd/generate_keys@main \
   --origin "oid/1.3.6.1.4.1.32473.312202" \
   --out_priv /tmp/mirror.sec \
   --out_pub /tmp/mirror.pub
+```
+
+For the **[Sunlight](https://github.com/FiloSottile/sunlight) mirror**:
+
+```bash
+go run filippo.io/sunlight/cmd/sunlight-keygen@main \
+  -f /tmp/sunlight_seed.bin \
+  -witness oid/1.3.6.1.4.1.32473.312201 \
+  -mirror oid/1.3.6.1.4.1.32473.312202 \
+  | awk -F': ' '/^Mirror vkey/ {print $2}' > /tmp/mirror.pub
 ```
 
 ### Running with an MTC Mirror
@@ -122,7 +134,9 @@ EOF
 ```
 
 #### 2. Start the Mirror Server
-Start the POSIX mirror server on port 6963:
+Start either the Tessera POSIX mirror or the Sunlight mirror on port 6963.
+
+**Option A: Tessera POSIX Mirror**
 
 ```bash
 go run ./cmd/mtc/mirror/posix \
@@ -131,6 +145,30 @@ go run ./cmd/mtc/mirror/posix \
   --config_path="/tmp/mirror_config" \
   --mirror_cosigner_path=/tmp/mirror.sec \
   --slog_level=-4
+```
+
+**Option B: Sunlight Mirror**
+
+```bash
+sqlite3 /tmp/sunlight_checkpoints.db \
+  "CREATE TABLE checkpoints (logID BLOB PRIMARY KEY, body BLOB NOT NULL) STRICT"
+
+cat <<EOF > /tmp/sunlight.yaml
+listen:
+  - "localhost:6963"
+checkpoints: /tmp/sunlight_checkpoints.db
+witness:
+  name: oid/1.3.6.1.4.1.32473.312201
+  submissionprefix: https://localhost
+  monitoringprefix: https://localhost
+  secret: /tmp/sunlight_seed.bin
+  localdirectory: /tmp/mtcmirror
+  mirrorname: oid/1.3.6.1.4.1.32473.312202
+  mirrorloglists:
+    - /tmp/mirror_config
+EOF
+
+go run filippo.io/sunlight/cmd/sunlight@main -c /tmp/sunlight.yaml
 ```
 
 #### 3. Create the Mirror Policy
